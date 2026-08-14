@@ -1,0 +1,6 @@
+{
+  "allowedLicenses": ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MPL-2.0", "Unlicense", "0BSD"],
+  "blockedLanguages": [],
+  "requireTests": false,
+  "minCommentRatio": 0
+}
