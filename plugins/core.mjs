@@ -125,7 +125,7 @@ export default {
     const safeQuery = (q) => String(q || '').trim()
     const clampLimit = (n) => Math.min(10, Math.max(1, Number(n) || 5))
 
-    const SKIP_DIRS = new Set(['node_modules', '.git', '.svn', '.hg', 'dist', 'build', 'out', 'target', 'vendor', '.venv', 'venv', '__pycache__', '.next', '.nuxt', '.cache', 'coverage', '.idea', '.vscode', 'Pods', '.gradle', 'bin', 'obj', 'tmp', 'temp', '.turbo', '.yarn', '.pnpm-store', '.dsh', '.terraform', '.mypy_cache', '.pytest_cache', '.ruff_cache', '.gitbook', 'docs', 'website'])
+    const SKIP_DIRS = new Set(['node_modules', '.git', '.svn', '.hg', 'dist', 'build', 'out', 'target', 'vendor', '.venv', 'venv', '__pycache__', '.next', '.nuxt', '.cache', 'coverage', '.idea', '.vscode', 'Pods', '.gradle', 'bin', 'obj', 'tmp', 'temp', '.turbo', '.yarn', '.pnpm-store', '.dsh', '.terraform', '.mypy_cache', '.pytest_cache', '.ruff_cache', '.gitbook', 'docs', 'website', 'tests', 'test', 'e2e'])
     const CODE_EXTS = new Set(['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'vue', 'svelte', 'py', 'go', 'rs', 'java', 'kt', 'kts', 'swift', 'c', 'cpp', 'cc', 'h', 'hpp', 'cs', 'php', 'rb', 'sh', 'lua', 'dart', 'scala', 'ex', 'exs', 'erl', 'clj', 'fs', 'fsx', 'ml', 'r', 'pl', 'sql', 'groovy'])
     const MAX_SCAN_FILES = 4000
     const MAX_FILE_BYTES = 262144
@@ -286,6 +286,114 @@ export default {
 
     function assessWords(query) {
       return queryWords(query).filter((w) => w.length >= 3 && !STOPWORDS.has(w))
+    }
+
+    // ═══ 架构级复用：能力词典 + 系统画像 + 架构相似度 ═══
+    const CAPABILITY_LEXICON = [
+      { label: '检索与索引', words: ['search', '检索', 'query', 'index', '索引', '全文', '搜索', 'lookup'] },
+      { label: '元数据与分类', words: ['metadata', '元数据', 'catalog', '目录', '分类', 'category', 'tag', '标签', 'taxonomy', 'classify', '编目', 'schema'] },
+      { label: '用户与权限', words: ['auth', '登录', 'login', 'user', '用户', 'role', '角色', 'permission', '权限', 'rbac', 'password', '密码', 'token', 'jwt', 'session', '会话', 'account', '账号'] },
+      { label: '审批与流程', words: ['approval', '审批', 'workflow', '流程', 'process', '审核', 'review', '流转', 'approve', 'reject', '驳回'] },
+      { label: '导入导出与批处理', words: ['export', '导出', 'import', '导入', 'batch', '批量', 'cron', '定时', 'scheduled', 'excel', 'csv'] },
+      { label: '报表与统计', words: ['report', '报表', 'dashboard', '大屏', '统计', 'analytics', 'chart', '图表', '可视化', 'statistics', '汇总'] },
+      { label: '审计与日志', words: ['audit', '审计', 'log', '日志', 'trace', '操作记录', '历史记录', 'history', '留痕'] },
+      { label: '文档与存储', words: ['storage', '存储', 'upload', '上传', 'download', '下载', 'file', '文件', 'document', '文档', 'archive', '归档', '附件', 'attachment', 'minio', 'oss'] },
+      { label: '资源与借还', words: ['borrow', '借阅', '借还', 'inventory', '馆藏', '库存', 'stock', 'asset', '资产', '物品', '设备', 'resource', '归还', 'reserve', '预约'] },
+      { label: '订单与交易', words: ['order', '订单', 'payment', '支付', 'invoice', '发票', 'transaction', '交易', '结算', '缴费', '收费'] },
+      { label: '通知与消息', words: ['notification', '通知', 'message', '消息', 'email', '邮件', 'sms', '短信', '推送', 'push', '站内信'] },
+      { label: 'API 与服务化', words: ['api', '接口', 'gateway', '网关', 'microservice', '微服务', 'rest', 'rpc', 'grpc', 'dto', 'middleware', '中间件'] },
+      { label: '任务与待办', words: ['task', '任务', 'todo', '待办', '代办', '提醒', 'reminder', 'deadline', '截止'] },
+      { label: '组织与机构', words: ['org', '组织', 'department', '部门', '机构', '单位', 'company', '学校', 'library', '图书馆', 'government', '政务', '档案'] },
+      { label: '管理后台', words: ['manage', '管理', 'admin', '后台', 'console', '控制台', 'platform', '平台', 'cms'] },
+    ]
+    const GENERIC_NAME_RE = /^(index|main|app|utils|helpers|common|types|config|constants|styles?|package|tsconfig|vitest|eslint|README|LICENSE|pnpm|yarn|lock|jest|setup|vite|rollup|babel|prettier)[.\-_]?/i
+
+    function capabilityLabelsOf(text) {
+      const lower = ' ' + String(text || '').toLowerCase() + ' '
+      const labels = []
+      for (const entry of CAPABILITY_LEXICON) {
+        for (const w of entry.words) {
+          if (lower.indexOf(w.toLowerCase()) >= 0) {
+            labels.push(entry.label)
+            break
+          }
+        }
+      }
+      return Array.from(new Set(labels))
+    }
+
+    function architectureSimilarity(reqLabels, systemLabels) {
+      if (reqLabels.length === 0) return { similarity: 0, overlap: [], missing: reqLabels }
+      const overlap = reqLabels.filter((l) => systemLabels.indexOf(l) >= 0)
+      return { similarity: Math.round((100 * overlap.length) / reqLabels.length), overlap, missing: reqLabels.filter((l) => systemLabels.indexOf(l) < 0) }
+    }
+
+    async function extractSystemProfile(rootPath, signal, budget) {
+      const root = String(rootPath || '').trim()
+      if (!root) return { error: '未提供 root' }
+      let rootTarget
+      try {
+        rootTarget = await ctx.fs.resolve(root, { signal })
+      } catch (error) {
+        return { error: '无法解析根目录 ' + root + ': ' + String((error && error.message) || error) }
+      }
+      let entries
+      try {
+        entries = await ctx.fs.listDir(rootTarget, signal)
+      } catch (error) {
+        return { error: '无法列出目录 ' + root }
+      }
+      const start = Date.now()
+      const timeBudget = budget && budget.timeBudgetMs ? budget.timeBudgetMs : 20000
+      const maxSystems = budget && budget.maxSystems ? budget.maxSystems : 12
+      const systems = []
+      for (const entry of entries) {
+        if (Date.now() - start > timeBudget) break
+        if (entry.type !== 'directory' || SKIP_DIRS.has(entry.name) || entry.name.startsWith('.')) continue
+        const fileSet = new Set()
+        let collected
+        try {
+          collected = await collectFiles(entry.target, CODE_EXTS, signal, fileSet, { fileBudget: 300, timeBudgetMs: Math.min(4000, Math.max(1000, timeBudget - (Date.now() - start))) })
+        } catch (error) {
+          continue
+        }
+        if (collected.pending.length < 3) continue
+        let textPool = entry.name + ' ' + collected.pending.map((p) => p.path.split('/').pop()).filter((n) => !GENERIC_NAME_RE.test(n)).join(' ')
+        for (const p of collected.pending.slice(0, 12)) {
+          try {
+            const t = await ctx.fs.readText(p.entry.target, signal)
+            textPool += ' ' + t.slice(0, 2000)
+          } catch (error) { /* 忽略 */ }
+        }
+        let lines = 0
+        for (const p of collected.pending.slice(0, 30)) {
+          try {
+            const t = await ctx.fs.readText(p.entry.target, signal)
+            lines += Math.min(t.split('\n').length, 2000)
+          } catch (error) { /* 忽略 */ }
+        }
+        const langs = new Set()
+        for (const p of collected.pending) {
+          const e = p.path.split('.').pop().toLowerCase()
+          if (EXT_LANG[e]) langs.add(EXT_LANG[e])
+        }
+        systems.push({
+          name: entry.name,
+          path: (() => {
+            try {
+              return ctx.fs.processPath(entry.target)
+            } catch (error) {
+              return entry.name
+            }
+          })(),
+          files: collected.pending.length,
+          lines,
+          languages: Array.from(langs).slice(0, 4),
+          capabilities: capabilityLabelsOf(textPool),
+        })
+        if (systems.length >= maxSystems) break
+      }
+      return { systems, scanned: systems.length }
     }
 
     function matchScoreOf(path, text, words) {
@@ -711,6 +819,9 @@ export default {
       collectLocalCandidates,
       queryWords,
       assessWords,
+      capabilityLabelsOf,
+      architectureSimilarity,
+      extractSystemProfile,
       analyzeLocalCandidate,
       analyzeRemoteCandidate,
       assessCandidates,

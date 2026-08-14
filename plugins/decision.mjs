@@ -67,6 +67,7 @@ export default {
       description:
         '复用调查（需求澄清后调用）：先自动调查本地代码库与开源平台的可复用候选并评估价值权衡，'
         + '然后把"候选清单 + 价值对比"呈现给用户并询问是否复用（用户可选择复用哪个候选/改造/不复用直接开发）。'
+        + '同时做架构级复用调查：扫描本地已有业务系统（顶层目录）画像，找出与新需求能力重叠度高的系统作为整体架构骨架候选。'
         + '若政策文件配置 reuseMode="auto"（或传 ask=false）则不询问，直接采用评估给出的推荐决策（优先复用）。'
         + '若无任何候选则不弹窗（mode=no-candidates，推荐 rewrite）。'
         + '注意：若返回 answer.status="unanswered"（用户未回答/询问超时），不得开始写代码，应先把调查结果报告给用户并等待其决定。'
@@ -75,7 +76,7 @@ export default {
         type: 'object',
         properties: {
           requirement: { type: 'string', description: '目标需求/功能描述（建议含英文术语关键词），调查与评估的基准' },
-          root: { type: 'string', description: '本地检索根目录（绝对路径）；省略时使用当前工作区根目录' },
+          root: { type: 'string', description: '本地检索根目录（绝对路径），其下每个顶层业务目录视为一个系统；省略时使用当前工作区根目录' },
           remoteSearch: { type: 'boolean', default: true, description: '是否同时调查开源平台（GitHub/npm 等），默认 true' },
           ask: { type: 'boolean', description: '是否询问用户；省略时读政策 reuseMode（默认询问）；false 时不询问直接返回推荐决策' },
           reuseThreshold: { type: 'integer', description: '直接复用匹配度阈值，默认 70' },
@@ -85,7 +86,7 @@ export default {
         required: ['requirement'],
       },
       output: { schema: { type: 'json' }, render: renderJson },
-      timeoutMs: 120000,
+      timeoutMs: 150000,
       presentCall: (args) => ({ card: 'generic', kind: 'read', title: '复用调查: ' + String((args && args.requirement) || '') }),
       async execute(args, exec) {
         const requirement = ref.safeQuery(args.requirement)
@@ -104,13 +105,42 @@ export default {
 
         const result = await ref.assessCandidates(requirement, localPaths, remoteSpecs, cfg, exec.signal)
         if (result.error) return { ok: false, message: result.error }
+
+        // 架构级复用：扫描本地系统画像，找出可作为整体骨架的系统候选
+        const systemCandidates = []
+        let rootPath = String(args.root || '').trim()
+        if (!rootPath) rootPath = ctx.sandboxPolicy.workspaceRoot || ''
+        if (rootPath) {
+          const reqLabels = ref.capabilityLabelsOf(requirement)
+          if (reqLabels.length > 0) {
+            const profile = await ref.extractSystemProfile(rootPath, exec.signal, { maxSystems: 10, timeBudgetMs: 15000 })
+            if (!profile.error && profile.systems.length > 0) {
+              for (const s of profile.systems) {
+                const sim = ref.architectureSimilarity(reqLabels, s.capabilities)
+                if (sim.similarity >= 50) {
+                  systemCandidates.push(Object.assign({}, s, { similarity: sim.similarity, overlap: sim.overlap, missing: sim.missing }))
+                }
+              }
+              systemCandidates.sort((a, b) => b.similarity - a.similarity)
+            }
+          }
+        }
+        const hasSystemCandidates = systemCandidates.length > 0
+
         const hasCandidates = result.locals.some((l) => !l.error && l.verdict !== 'not-suitable')
           || result.remotes.some((r) => !r.blocked)
+          || hasSystemCandidates
 
         const lines = []
         lines.push('需求：' + requirement)
+        if (hasSystemCandidates) {
+          lines.push('本地系统骨架候选（架构级复用，相似度 >=50）：')
+          for (const s of systemCandidates) {
+            lines.push('  - ' + s.name + '：架构相似度 ' + s.similarity + '/100，能力 ' + s.capabilities.join('、') + '，' + s.files + ' 文件 / ' + s.lines + ' 行 / ' + s.languages.join(', '))
+          }
+        }
         if (result.locals.length > 0) {
-          lines.push('本地候选（' + result.locals.length + ' 个）：')
+          lines.push('本地文件候选（' + result.locals.length + ' 个）：')
           for (const l of result.locals) {
             if (l.error) {
               lines.push('  - ' + l.path + '：' + l.error)
@@ -143,8 +173,9 @@ export default {
             provider: 'reuse-survey',
             requirement,
             mode: 'no-candidates',
-            note: '未找到任何可复用候选，无需询问；推荐按评估决策（通常为自制）直接开发。',
+            note: '未找到任何可复用候选（含系统骨架），无需询问；推荐按评估决策（通常为自制）直接开发。',
             survey: summary,
+            systemCandidates,
             localCandidates: result.locals,
             remoteCandidates: result.remotes.slice(0, 3),
             policyChecks: result.checks,
@@ -167,6 +198,7 @@ export default {
                 mode: 'auto-fallback',
                 note: '用户询问服务不可用（当前上下文无法询问），已按推荐决策返回',
                 survey: summary,
+                systemCandidates,
                 localCandidates: result.locals,
                 remoteCandidates: result.remotes.slice(0, 3),
                 policyChecks: result.checks,
@@ -175,6 +207,12 @@ export default {
               }
             }
             const options = []
+            for (const s of systemCandidates) {
+              options.push({
+                label: '以本地系统 ' + s.name + ' 为骨架开发（架构相似度 ' + s.similarity + '/100）',
+                description: s.path + '：能力 ' + s.capabilities.join('、') + '；复用其整体架构（模块划分/数据模型/权限模型）后替换业务模块',
+              })
+            }
             for (const l of result.locals) {
               if (l.error || l.verdict === 'not-suitable') continue
               const base = l.path.split('/').pop()
@@ -197,7 +235,7 @@ export default {
                   questions: [{
                     id: 'reuse-choice',
                     header: '复用调查结果',
-                    question: '是否需要复用已有代码？以下是调查与价值权衡：',
+                    question: '是否需要复用已有代码（或已有系统的架构骨架）？以下是调查与价值权衡：',
                     detail: summary,
                     options,
                   }],
@@ -233,6 +271,7 @@ export default {
           requirement,
           mode: shouldAsk ? 'ask' : 'auto',
           survey: summary,
+          systemCandidates,
           localCandidates: result.locals,
           remoteCandidates: result.remotes.slice(0, 3),
           policyChecks: result.checks,
@@ -254,6 +293,13 @@ export default {
         + 'evaluates the reuse-vs-rewrite value tradeoff (reuse_value_assessment logic), and then ASKS the user '
         + 'which candidate to reuse (or whether to skip reuse and build from scratch) with the tradeoffs shown. '
         + 'Follow the user\'s choice.\n'
+        + 'Architecture-level reuse: besides finding similar implementations, also check whether an existing '
+        + 'local system\'s overall architecture can be reused as the skeleton for the new system. For example, a '
+        + 'library retrieval system may share capabilities (search & indexing, user & permissions, document & '
+        + 'storage, admin backend) with a government document management system built earlier, so that system can '
+        + 'serve as the skeleton. reuse_survey and architecture_reuse_search scan local top-level business '
+        + 'directories, extract capability labels (15 categories), and rank systems by capability-overlap '
+        + 'similarity; ask the user whether to build on one as the skeleton before writing code.\n'
         + 'CRITICAL: if reuse_survey returns answer.status === "unanswered" (user did not answer, question timed '
         + 'out, or the question could not be shown), you MUST NOT start writing code. Report the survey results '
         + 'and candidate list to the user in your reply and wait for the user to explicitly choose a candidate '

@@ -487,5 +487,60 @@ export default {
         }
       },
     })
+
+    ctx.tools.register({
+      name: 'architecture_reuse_search',
+      description:
+        '架构级复用检索：不仅查找相似功能的实现，还判断本地已有系统的整体架构是否可以直接复用。'
+        + '根据需求提取业务能力标签（15 类：检索与索引/元数据与分类/用户与权限/审批与流程/导入导出与批处理/报表与统计/审计与日志/文档与存储/资源与借还/订单与交易/通知与消息/API 与服务化/任务与待办/组织与机构/管理后台），'
+        + '扫描本地根目录下的每个业务系统（顶层目录），生成系统画像（能力矩阵、文件数、行数、语言），'
+        + '计算需求与每个系统的架构相似度并按相似度降序返回。'
+        + '典型场景：要做图书馆检索系统时，本地某个政务文件管理系统可能与其共享"检索与索引/用户与权限/文档与存储/管理后台"等能力，可直接以它为骨架。',
+      parameters: {
+        type: 'object',
+        properties: {
+          requirement: { type: 'string', description: '新系统需求描述，如 "图书馆检索系统：图书检索、借阅归还、读者管理、馆藏分类"' },
+          root: { type: 'string', description: '本地根目录（绝对路径），其下每个顶层业务目录视为一个系统；省略时使用当前工作区根目录' },
+          minSimilarity: { type: 'integer', default: 30, description: '相似度下限（0-100），只返回达到该值的系统，默认 30' },
+        },
+        required: ['requirement'],
+      },
+      output: { schema: { type: 'json' }, render: renderJson },
+      timeoutMs: 120000,
+      presentCall: (args) => ({ card: 'generic', kind: 'read', title: '架构级复用检索: ' + String((args && args.requirement) || '') }),
+      async execute(args, exec) {
+        const requirement = ref.safeQuery(args.requirement)
+        if (requirement === '') throw new Error('requirement 不能为空')
+        const minSimilarity = Math.min(100, Math.max(0, args.minSimilarity === undefined || args.minSimilarity === null || args.minSimilarity === '' ? 30 : Number(args.minSimilarity)))
+        let rootPath = String(args.root || '').trim()
+        if (!rootPath) rootPath = ctx.sandboxPolicy.workspaceRoot || ''
+        if (!rootPath) return { ok: false, message: '未提供 root 且无法确定工作区根目录，请通过 root 参数指定绝对路径' }
+
+        const reqLabels = ref.capabilityLabelsOf(requirement)
+        if (reqLabels.length === 0) {
+          return { ok: false, message: '无法从需求中提取任何业务能力标签。请用业务语言描述需求，例如"图书馆检索系统：图书检索、借阅归还、读者管理、馆藏分类"（可含中文或英文关键词）。' }
+        }
+        const profile = await ref.extractSystemProfile(rootPath, exec.signal, { maxSystems: 12, timeBudgetMs: 25000 })
+        if (profile.error) return { ok: false, message: profile.error }
+
+        const ranked = profile.systems.map((s) => {
+          const sim = ref.architectureSimilarity(reqLabels, s.capabilities)
+          return Object.assign({}, s, { similarity: sim.similarity, overlap: sim.overlap, missing: sim.missing })
+        }).filter((s) => s.similarity >= minSimilarity).sort((a, b) => b.similarity - a.similarity)
+
+        return {
+          ok: true,
+          provider: 'architecture-reuse',
+          requirement,
+          capabilityLabels: reqLabels,
+          scannedSystems: profile.scanned,
+          minSimilarity,
+          results: ranked.slice(0, 8),
+          note: ranked.length === 0
+            ? '没有找到架构相似度达到 ' + minSimilarity + ' 的本地系统；可降低 minSimilarity 或更换 root 后再试。'
+            : '相似度 = 需求能力标签与系统能力标签的重叠比例。可选用最高相似度系统作为新系统的架构骨架（能力重叠越多，复用架构的收益越大）；再用 code_architecture_review 检查该系统的依赖结构是否健康。',
+        }
+      },
+    })
   },
 }
