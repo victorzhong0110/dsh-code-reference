@@ -58,15 +58,29 @@ DeepSeek Harness (DSH) 代码参考检索与工程规范插件：在**厘清需�
 
 ## 安装
 
+## 架构（拆分为三个小插件，通过 codeRef 服务协作）
+
+| 插件 | 职责 | 文件 |
+|---|---|---|
+| `code-ref-core` | 共享服务（HTTP 请求、本地扫描、候选评估、政策、决策引擎） | `plugins/core.mjs` |
+| `code-ref-tools` | 6 个检索工具 + 架构自检 | `plugins/tools.mjs` |
+| `code-ref-decision` | 复用价值评估 + 复用调查询问 + 工程规范提示词 | `plugins/decision.mjs` |
+
+## 安装
+
 ### 部署级（推荐：所有会话 + 重启后持久生效）
 
-1. 把 `index.mjs` 放到任意目录（如 `~/.dsh/plugins/code-reference/index.mjs`）
+1. 把 `plugins/` 下三个 `.mjs` 文件放到任意目录（如 `~/.dsh/plugins/code-reference/`）
 2. 在 DSH 配置的 patch 层（如 `~/.dsh/profiles/web/cordis.patch.yml`）追加：
 
 ```yaml
 - insert:
-    - id: code-reference
-      name: /绝对路径/index.mjs
+    - id: code-ref-core
+      name: /绝对路径/core.mjs
+    - id: code-ref-tools
+      name: /绝对路径/tools.mjs
+    - id: code-ref-decision
+      name: /绝对路径/decision.mjs
 ```
 
 3. 重启 DSH，所有会话自动获得工具与复用调查流程
