@@ -1,7 +1,8 @@
-// dsh-code-reference 部署级插件（与动态版 pkg-13 逻辑一致，普通 Cordis 插件形态）
+// dsh-code-reference 部署级插件 v2（与动态版 ghref-1/pkg-15 逻辑一致）
+// 模式：需求澄清 → reuse_survey 调查 → 询问用户（或 reuseMode=auto 不询问优先复用）；无强制拦截
 // 安装：在 cordis.patch.yml / cordis.yml 增加行 { id: code-reference, name: <本文件绝对路径> }
 export default {
-  inject: ['subprocess', 'web', 'systemPrompt', 'fs'],
+  inject: ['subprocess', 'web', 'systemPrompt', 'fs', 'timer'],
   apply(ctx) {
     const README_CHARS = 6000
     const FILE_CHARS = 8000
@@ -172,70 +173,483 @@ export default {
       return { pending, truncated }
     }
 
-    // ═══ 系统强制：先检索 → 有候选先评估 → 再写 ═══
-    const agentState = new Map()
-    const agentIdOf = (exec) => (exec && exec.agent ? exec.agent.id : undefined)
-
-    function markSearch(exec, hadCandidates) {
-      const id = agentIdOf(exec)
-      if (id === undefined) return
-      const s = agentState.get(id) || { searched: false, hadCandidates: false, assessed: false }
-      s.searched = true
-      if (hadCandidates) s.hadCandidates = true
-      agentState.set(id, s)
+    function wordDefRegex(w) {
+      return new RegExp(
+        '^\\s*(?:'
+          + '(?:(?:export\\s+(?:default\\s+)?)?(?:async\\s+)?function\\s+\\w*' + w + '\\w*\\s*[(])'
+          + '|(?:(?:export\\s+)?(?:const|let|var)\\s+\\w*' + w + '\\w*\\s*=\\s*(?:async\\s*)?(?:\\w+\\s*=>|function|[(]))'
+          + '|(?:(?:export\\s+)?(?:abstract\\s+)?class\\s+\\w*' + w + '\\w*)'
+          + '|(?:(?:export\\s+)?(?:interface|type|enum)\\s+\\w*' + w + '\\w*)'
+          + '|(?:(?:async\\s+)?def\\s+\\w*' + w + '\\w*\\s*[(])'
+          + '|(?:class\\s+\\w*' + w + '\\w*)'
+          + '|(?:(?:pub\\s+)?(?:async\\s+)?fn\\s+\\w*' + w + '\\w*)'
+          + '|(?:(?:pub\\s+)?(?:struct|enum|trait|impl)\\s+\\w*' + w + '\\w*)'
+          + '|(?:func\\s+\\w*' + w + '\\w*\\s*[(])'
+          + '|(?:(?:public|private|protected)\\s+(?:static\\s+|final\\s+|abstract\\s+|async\\s+)*[\\w<>,.?\\[\\]\\s]*\\w*' + w + '\\w*\\s*[(])'
+          + '|(?:(?:public|private|protected)\\s+(?:static\\s+)?class\\s+\\w*' + w + '\\w*)'
+          + ')',
+        'i')
     }
 
-    function markAssessed(exec) {
-      const id = agentIdOf(exec)
-      if (id === undefined) return
-      const s = agentState.get(id) || { searched: false, hadCandidates: false, assessed: false }
-      s.assessed = true
-      agentState.set(id, s)
+    function wordLooseRegex(w) {
+      if (/^[a-zA-Z0-9_]+$/.test(w)) {
+        return new RegExp('^\\s*(?:export\\s+)?(?:const|let|var|function|class|interface|type|enum|def|fn|func|struct|trait|impl|public|private|protected|async|static)\\b[^\\n]{0,240}\\b' + w + '\\b', 'i')
+      }
+      return new RegExp('^\\s*(?:export\\s+)?(?:const|let|var|function|class|interface|type|enum|def|fn|func|struct|trait|impl|public|private|protected|async|static)\\b', 'i')
     }
 
-    ctx.on('tools/pre-execute', async (exec, next) => {
-      if (exec && exec.name === 'write') {
-        const id = agentIdOf(exec)
-        const s = id === undefined ? undefined : agentState.get(id)
-        const path = exec.arguments && typeof exec.arguments.file_path === 'string' ? exec.arguments.file_path : ''
-        let isNew = false
-        if (path) {
-          try {
-            const target = await ctx.fs.resolve(path, { signal: exec.signal })
-            const info = await ctx.fs.stat(target, exec.signal)
-            isNew = info === undefined
-          } catch (error) {
-            isNew = false
-          }
+    function queryWords(query) {
+      const words = (query.match(/[a-zA-Z0-9_\u4e00-\u9fa5]+/g) || []).map((w) => w.toLowerCase())
+      return words.filter((w) => w.length >= 2).slice(0, 8)
+    }
+
+    async function collectLocalCandidates(query, rootPath, signal) {
+      const words = queryWords(query)
+      if (words.length === 0) return { words, candidates: [], scanned: 0, truncated: false }
+      const exts = CODE_EXTS
+      let root = String(rootPath || '').trim()
+      if (!root) {
+        const policy = ctx.get('sandboxPolicy')
+        root = policy && policy.workspaceRoot ? policy.workspaceRoot : ''
+      }
+      if (!root) return { words, candidates: [], scanned: 0, truncated: false, error: '未提供 root 且无法确定工作区根目录' }
+      let rootTarget
+      try {
+        rootTarget = await ctx.fs.resolve(root, { signal })
+      } catch (error) {
+        return { words, candidates: [], scanned: 0, truncated: false, error: '无法解析检索根目录 ' + root + ': ' + String((error && error.message) || error) }
+      }
+      const defRegexes = words.map((w) => ({ exact: wordDefRegex(w), loose: wordLooseRegex(w), word: w, ascii: /^[a-zA-Z0-9_]+$/.test(w) }))
+      const hits = []
+      let collected
+      try {
+        collected = await collectFiles(rootTarget, exts, signal)
+      } catch (error) {
+        return { words, candidates: [], scanned: 0, truncated: false, error: String((error && error.message) || error) }
+      }
+      const readAndMatch = async (entry, path) => {
+        let text
+        try {
+          text = await ctx.fs.readText(entry.target, signal)
+        } catch (error) {
+          return
         }
-        if (isNew) {
-          if (!s || !s.searched) {
-            return {
-              kind: 'deny',
-              reason: '【系统强制：先复用再开发（第 1 步/共 2 步）】创建新文件 ' + path + ' 之前，本会话尚未执行过复用检索。'
-                + '请先调用 local_code_reuse_search 在本地代码库中检索是否已有可复用的函数/组件/模块'
-                + '（root 省略时默认当前工作区），新项目/新组件还建议用 github_reference_search 等平台工具检索公开参考实现；'
-                + '完成检索后重试写入。',
+        if (text.indexOf('\u0000') >= 0) return
+        const lines = text.split('\n')
+        const limit = Math.min(lines.length, 20000)
+        for (let i = 0; i < limit; i++) {
+          const line = lines[i]
+          let score = 0
+          for (const d of defRegexes) {
+            if (d.exact.test(line)) {
+              score = Math.max(score, 2)
+            } else if (d.loose.test(line) && (d.ascii || line.indexOf(d.word) >= 0)) {
+              score = Math.max(score, 1)
             }
           }
-          if (s.hadCandidates && !s.assessed) {
-            return {
-              kind: 'deny',
-              reason: '【系统强制：先评估复用价值（第 2 步/共 2 步）】检索发现存在可复用候选，但本会话尚未评估其复用价值。'
-                + '请调用 reuse_value_assessment 对候选做量化评估（参数：requirement=目标需求描述（建议包含英文术语关键词），'
-                + 'localCandidates=本地候选路径（逗号分隔），remoteCandidate=开源候选如 owner/repo 或 npm:包名；'
-                + '可按需调整阈值参数或指定 policyPath 公司政策文件）。'
-                + '评估工具会给出复用判断标准（匹配度/改造成本/质量信号/维护活跃度/公司政策）与决策建议 '
-                + '（reuse 直接复用 / adapt 改造复用 / dependency 引入依赖 / rewrite 自制）；'
-                + '评估建议自制（rewrite）时可直接重试写入。',
+          if (score > 0) {
+            hits.push({ path, line: i + 1, lineText: line.trim().slice(0, 160), score })
+            break
+          }
+        }
+      }
+      const pending = collected.pending
+      for (let i = 0; i < pending.length; i += 8) {
+        if (signal && signal.aborted) return { words, candidates: [], scanned: 0, truncated: collected.truncated, error: '检索已取消' }
+        await Promise.all(pending.slice(i, i + 8).map((p) => readAndMatch(p.entry, p.path)))
+      }
+      const seen = new Set()
+      const files = hits.filter((h) => {
+        if (seen.has(h.path)) return false
+        seen.add(h.path)
+        return true
+      }).sort((a, b) => b.score - a.score)
+      return {
+        words,
+        root,
+        candidates: files.slice(0, 8).map((h) => ({ path: h.path, line: h.line, lineText: h.lineText, score: h.score })),
+        scanned: pending.length,
+        truncated: collected.truncated,
+      }
+    }
+
+    // ═══ 复用价值评估（阈值 + 公司政策） ═══
+    const STOPWORDS = new Set(['the', 'and', 'with', 'for', 'from', 'this', 'that', 'using', 'use', 'used', 'make', 'create', 'provide', 'based', 'via', 'tool', 'utility', 'module', 'function', 'component', 'support', 'supports', 'like', 'into', 'your', 'our', 'can', 'will', 'does', 'would', 'should', 'need', 'needs', 'want', 'feature', 'features', 'system', 'also', 'all', 'any', 'are', 'was', 'were', 'been', 'has', 'have', 'had', 'its', 'them', 'their', 'there', 'where', 'which', 'when', 'what', 'who', 'how', 'why', 'but', 'not', 'only', 'just', 'more', 'most', 'some', 'such', 'than', 'then', 'other', 'others'])
+
+    function assessWords(query) {
+      return queryWords(query).filter((w) => w.length >= 3 && !STOPWORDS.has(w))
+    }
+
+    function matchScoreOf(path, text, words) {
+      const asciiWords = words.filter((w) => /^[a-zA-Z0-9_]+$/.test(w))
+      const cjkWords = words.filter((w) => !/^[a-zA-Z0-9_]+$/.test(w))
+      const head = text.slice(0, 4000).toLowerCase()
+      const base = path.split('/').pop().replace(/\.[^.]+$/, '')
+      const nameTokens = base.split(/[^a-zA-Z0-9]+/).filter(Boolean).map((t) => t.toLowerCase())
+      if (asciiWords.length > 0) {
+        let contentHits = 0
+        for (const w of asciiWords) if (head.indexOf(w) >= 0) contentHits++
+        let nameHits = 0
+        for (const w of asciiWords) {
+          if (nameTokens.some((t) => t.indexOf(w) >= 0 || w.indexOf(t) >= 0)) nameHits++
+        }
+        let cjkHits = 0
+        for (const w of cjkWords) if (head.indexOf(w) >= 0) cjkHits++
+        const contentPart = 70 * (contentHits / Math.max(1, asciiWords.length))
+        const namePart = 30 * (nameHits / Math.max(1, asciiWords.length))
+        const cjkBonus = cjkHits > 0 ? 10 : 0
+        return Math.min(100, Math.round(contentPart + namePart + cjkBonus))
+      }
+      if (cjkWords.length > 0) {
+        let cjkHits = 0
+        for (const w of cjkWords) if (head.indexOf(w) >= 0) cjkHits++
+        return Math.min(100, Math.round(100 * (cjkHits / cjkWords.length)))
+      }
+      return 0
+    }
+
+    function effortOf(match, lines, complexity, cfg) {
+      if (match >= cfg.reuseThreshold && lines <= cfg.smallLines && complexity <= cfg.maxComplexityPercent / 100) {
+        return { level: 'low', estimate: '约 0.5–2 小时' }
+      }
+      if (match >= cfg.adaptThreshold || lines <= cfg.mediumLines) {
+        return { level: 'medium', estimate: '约 2 小时–1 天' }
+      }
+      return { level: 'high', estimate: '约 1–3 天' }
+    }
+
+    const EXT_LANG = { ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript', py: 'python', go: 'go', rs: 'rust', java: 'java', kt: 'kotlin', kts: 'kotlin', c: 'c', cpp: 'c++', cc: 'c++', h: 'c', hpp: 'c++', cs: 'c#', php: 'php', rb: 'ruby', swift: 'swift', sh: 'shell', vue: 'vue', svelte: 'svelte', dart: 'dart', scala: 'scala', sql: 'sql', groovy: 'groovy' }
+    const extToLanguage = (path) => {
+      const dot = path.lastIndexOf('.')
+      const ext = dot >= 0 ? path.slice(dot + 1).toLowerCase() : ''
+      return EXT_LANG[ext] || ext
+    }
+
+    function normalizePolicy(d) {
+      return {
+        allowedLicenses: Array.isArray(d.allowedLicenses) ? d.allowedLicenses.map(String) : [],
+        blockedLanguages: Array.isArray(d.blockedLanguages) ? d.blockedLanguages.map(String).map((s) => s.toLowerCase()) : [],
+        requireTests: d.requireTests === true,
+        minCommentRatio: Number(d.minCommentRatio) > 0 ? Number(d.minCommentRatio) : 0,
+        reuseMode: d.reuseMode === 'auto' ? 'auto' : 'ask',
+      }
+    }
+
+    async function loadPolicy(policyPath, localPaths, signal) {
+      const candidates = []
+      const explicit = String(policyPath || '').trim()
+      if (explicit) candidates.push(explicit)
+      const policy = ctx.get('sandboxPolicy')
+      const ws = policy && policy.workspaceRoot ? policy.workspaceRoot : ''
+      if (ws) candidates.push(ws + '/.code-reference-policy.json')
+      for (const p of localPaths) {
+        let dir = p.slice(0, p.lastIndexOf('/'))
+        for (let i = 0; i < 3 && dir.length > 1; i++) {
+          candidates.push(dir + '/.code-reference-policy.json')
+          const s = dir.lastIndexOf('/')
+          if (s <= 0) break
+          dir = dir.slice(0, s)
+        }
+      }
+      const seen = new Set()
+      for (const path of candidates) {
+        if (seen.has(path)) continue
+        seen.add(path)
+        let target
+        try {
+          target = await ctx.fs.resolve(path, { signal })
+        } catch (error) {
+          continue
+        }
+        let info
+        try {
+          info = await ctx.fs.stat(target, signal)
+        } catch (error) {
+          continue
+        }
+        if (!info) continue
+        let text
+        try {
+          text = await ctx.fs.readText(target, signal)
+        } catch (error) {
+          continue
+        }
+        try {
+          const data = JSON.parse(text)
+          return { source: path, data: normalizePolicy(data), note: '已加载公司政策文件 ' + path }
+        } catch (error) {
+          return { source: path, data: null, note: '政策文件不是合法 JSON，使用宽松默认：' + String((error && error.message) || error) }
+        }
+      }
+      const tried = Array.from(seen).join('、')
+      return { source: tried || null, data: null, note: '未找到政策文件（尝试：' + (tried || '无') + '），使用宽松默认' }
+    }
+
+    function buildPolicyChecks(policy, locals, remote) {
+      const checks = []
+      const p = policy && policy.data
+      if (!p) return checks
+      if (p.blockedLanguages.length > 0) {
+        for (const l of locals) {
+          if (!l.error) {
+            const lang = extToLanguage(l.path)
+            if (p.blockedLanguages.indexOf(lang) >= 0) {
+              checks.push({ rule: 'language', status: 'fail', detail: '候选 ' + l.path + ' 使用语言 ' + lang + '，在公司禁止语言列表中' })
             }
           }
         }
       }
-      return next()
-    })
+      if (p.allowedLicenses.length > 0 && remote && !remote.error && remote.license) {
+        const ok = p.allowedLicenses.some((x) => String(x).toLowerCase() === String(remote.license).toLowerCase())
+        if (!ok) {
+          checks.push({ rule: 'license', status: 'fail', detail: '候选许可证 ' + remote.license + ' 不在公司允许列表（' + p.allowedLicenses.join(', ') + '）中' })
+        }
+      }
+      if (p.requireTests) {
+        for (const l of locals) {
+          if (!l.error && !l.hasTest) {
+            checks.push({ rule: 'tests', status: 'warn', detail: '候选 ' + l.path + ' 缺少测试文件，而公司要求测试覆盖；复用后需补充测试' })
+          }
+        }
+      }
+      if (p.minCommentRatio > 0) {
+        for (const l of locals) {
+          if (!l.error && l.commentRatio < Math.round(p.minCommentRatio * 100)) {
+            checks.push({ rule: 'comments', status: 'warn', detail: '候选 ' + l.path + ' 注释比 ' + l.commentRatio + '% 低于公司要求 ' + Math.round(p.minCommentRatio * 100) + '%' })
+          }
+        }
+      }
+      return checks
+    }
+
+    async function analyzeLocalCandidate(path, words, signal) {
+      let target
+      try {
+        target = await ctx.fs.resolve(path, { signal })
+      } catch (error) {
+        return { path, error: '无法解析路径: ' + String((error && error.message) || error) }
+      }
+      let text
+      try {
+        text = await ctx.fs.readText(target, signal)
+      } catch (error) {
+        return { path, error: '读取失败: ' + String((error && error.message) || error) }
+      }
+      if (text.indexOf('\u0000') >= 0) return { path, error: '二进制文件，跳过' }
+      const lines = text.split('\n')
+      const total = lines.length
+      let comment = 0
+      let branches = 0
+      let declarations = 0
+      for (const l of lines) {
+        const t = l.trim()
+        if (!t) continue
+        if (t.startsWith('//') || t.startsWith('#') || t.startsWith('*') || t.startsWith('/*') || t.startsWith('--') || t.startsWith(';')) comment++
+        if (/\b(if|switch|case|for|while|catch)\b/.test(t) || t.indexOf('?') >= 0) branches++
+        if (/\b(function|class|def|fn|func|const|let|var|interface|type|enum|struct|impl|public|private)\b/.test(t)) declarations++
+      }
+      const match = matchScoreOf(path, text, words)
+      const complexity = branches / Math.max(1, total)
+
+      let hasTest = false
+      try {
+        const slash = path.lastIndexOf('/')
+        const dirPath = slash >= 0 ? path.slice(0, slash) : path
+        const dirTarget = await ctx.fs.resolve(dirPath, { signal })
+        const entries = await ctx.fs.listDir(dirTarget, signal)
+        const baseName = path.slice(slash + 1).replace(/\.[^.]+$/, '')
+        hasTest = entries.some((e) => e.type === 'file' && e.name.startsWith(baseName) && (e.name.indexOf('.test.') >= 0 || e.name.indexOf('.spec.') >= 0 || e.name.indexOf('_test.') >= 0))
+      } catch (error) { /* 忽略 */ }
+
+      return {
+        path,
+        language: extToLanguage(path),
+        lines: total,
+        commentRatio: Math.round((100 * comment) / Math.max(1, total)),
+        branches,
+        declarations,
+        matchScore: match,
+        complexityPercent: Math.round(complexity * 100),
+        hasTest,
+        reasons: [],
+      }
+    }
+
+    async function analyzeRemoteCandidate(spec, words, signal) {
+      if (!spec) return null
+      const s = String(spec).trim()
+      if (s.startsWith('npm:')) {
+        const name = s.slice(4).trim()
+        const r = await apiRequest('https://registry.npmjs.org/' + encodeURIComponent(name), { signal })
+        if (r.status !== 200) return { spec: s, error: 'npm 查询失败（HTTP ' + r.status + '）' }
+        const m = parseJson(r)
+        if (!m) return { spec: s, error: 'npm 返回无法解析的数据' }
+        const latest = m['dist-tags'] && m['dist-tags'].latest ? m['dist-tags'].latest : ''
+        const version = latest && m.versions && m.versions[latest] ? m.versions[latest] : {}
+        const desc = String(m.description || '').toLowerCase()
+        const asciiWords = words.filter((w) => /^[a-zA-Z0-9_]+$/.test(w))
+        let hits = 0
+        for (const w of asciiWords) if (desc.indexOf(w) >= 0) hits++
+        const match = Math.round((100 * hits) / Math.max(1, asciiWords.length))
+        const published = version.date || (m.time && m.time[latest]) || ''
+        const months = monthsSince(published)
+        return {
+          spec: s,
+          kind: 'npm',
+          name,
+          version: latest,
+          description: m.description || '',
+          license: version.license || '',
+          matchScore: match,
+          lastPublish: published || '',
+          active: months !== null && months < 12,
+        }
+      }
+      const clean = s.replace(/^https?:\/\//, '').replace(/^github\.com\//, '').replace(/\/$/, '')
+      const parts = clean.split('/').filter(Boolean)
+      if (parts.length < 2) return { spec: s, error: '无法识别的仓库格式（应为 owner/repo 或 https://github.com/owner/repo）' }
+      const owner = parts[0].replace(/[^\w.-]/g, '')
+      const repo = parts[1].replace(/[^\w.-]/g, '')
+      const r = await apiRequest('https://api.github.com/repos/' + owner + '/' + repo, { signal })
+      if (r.status === 404) return { spec: s, error: '仓库不存在或为私有' }
+      if (r.status !== 200) return { spec: s, error: 'GitHub 查询失败（HTTP ' + r.status + '）' }
+      const m = parseJson(r)
+      if (!m) return { spec: s, error: 'GitHub 返回无法解析的数据' }
+      const desc = String(m.description || '').toLowerCase()
+      const asciiWords = words.filter((w) => /^[a-zA-Z0-9_]+$/.test(w))
+      let hits = 0
+      for (const w of asciiWords) if (desc.indexOf(w) >= 0) hits++
+      const match = Math.round((100 * hits) / Math.max(1, asciiWords.length))
+      const months = monthsSince(m.updated_at || '')
+      return {
+        spec: s,
+        kind: 'github',
+        fullName: m.full_name || owner + '/' + repo,
+        description: m.description || '',
+        stars: m.stargazers_count || 0,
+        license: m.license && m.license.spdx_id ? m.license.spdx_id : '',
+        matchScore: match,
+        lastUpdated: m.updated_at || '',
+        active: months !== null && months < 12,
+      }
+    }
+
+    function monthsSince(iso) {
+      if (!iso) return null
+      const t = Date.parse(iso)
+      if (Number.isNaN(t)) return null
+      return Math.max(0, Math.round((Date.now() - t) / (1000 * 60 * 60 * 24 * 30)))
+    }
+
+    function decide(localBest, remote, cfg, checks) {
+      const licenseBlocked = checks.some((c) => c.rule === 'license' && c.status === 'fail')
+      const languageBlocked = (l) => l !== undefined && checks.some((c) => c.rule === 'language' && c.status === 'fail' && c.detail.indexOf(l.path) >= 0)
+      const testsRequired = checks.some((c) => c.rule === 'tests' && c.status === 'warn')
+
+      if (localBest && !languageBlocked(localBest)) {
+        const needsTests = testsRequired && !localBest.hasTest
+        if (localBest.matchScore >= cfg.reuseThreshold && localBest.effort.level === 'low') {
+          if (needsTests) {
+            return {
+              choice: 'adapt',
+              confidence: 'medium',
+              reason: '本地候选匹配度 ' + localBest.matchScore + '>= ' + cfg.reuseThreshold + ' 且改造成本低（' + localBest.effort.estimate + '），但公司政策要求测试覆盖而候选缺少测试：建议复用并补充测试后交付。',
+            }
+          }
+          return {
+            choice: 'reuse',
+            confidence: 'high',
+            reason: '本地候选匹配度 ' + localBest.matchScore + '>= ' + cfg.reuseThreshold + ' 且改造成本低（' + localBest.effort.estimate + '），复用总成本显著低于自制，建议直接复用。',
+          }
+        }
+        if (localBest.matchScore >= cfg.adaptThreshold) {
+          return {
+            choice: 'adapt',
+            confidence: 'medium',
+            reason: '本地候选匹配度 ' + localBest.matchScore + '（阈值 ' + cfg.adaptThreshold + '），需改造（' + localBest.effort.estimate + '）。若改造工作量小于从零实现（同规模约 2-3 倍于改造工作量），建议改造复用；否则自制。' + (needsTests ? '注意：公司要求测试覆盖，改造时需补测试。' : ''),
+          }
+        }
+      }
+      if (remote && !remote.error && !licenseBlocked && remote.matchScore >= cfg.remoteThreshold && remote.active) {
+        return {
+          choice: 'dependency',
+          confidence: 'medium',
+          reason: '开源候选维护活跃且描述匹配（' + remote.matchScore + '>= ' + cfg.remoteThreshold + '），引入依赖通常优于自制；许可证 ' + (remote.license || '未知') + ' 已通过公司政策检查。',
+        }
+      }
+      const policyNote = licenseBlocked ? '（候选许可证未通过公司政策检查，已排除）' : ''
+      return {
+        choice: 'rewrite',
+        confidence: 'high',
+        reason: '未找到匹配度足够高、改造成本足够低的候选，或候选被公司政策排除' + policyNote + '；从零实现的成本低于复用的总成本，建议自制。',
+      }
+    }
 
     const renderJson = (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
+
+    function defaultConfig(args) {
+      const cfg = {
+        reuseThreshold: Math.min(100, Math.max(1, Number(args && args.reuseThreshold) || 70)),
+        adaptThreshold: Math.min(100, Math.max(1, Number(args && args.adaptThreshold) || 40)),
+        remoteThreshold: Math.min(100, Math.max(1, Number(args && args.remoteThreshold) || 50)),
+        smallLines: Math.max(1, Number(args && args.smallLines) || 300),
+        mediumLines: Math.max(1, Number(args && args.mediumLines) || 800),
+        maxComplexityPercent: Math.min(100, Math.max(1, Number(args && args.maxComplexityPercent) || 12)),
+      }
+      if (cfg.adaptThreshold > cfg.reuseThreshold) cfg.adaptThreshold = cfg.reuseThreshold
+      return cfg
+    }
+
+    async function assessCandidates(requirement, localPaths, remoteSpec, cfg, signal) {
+      const words = assessWords(requirement)
+      const policy = await loadPolicy(undefined, localPaths, signal)
+      const locals = []
+      for (const p of localPaths) {
+        const a = await analyzeLocalCandidate(p, words, signal)
+        locals.push(a)
+        if (signal && signal.aborted) return { words, policy, locals, remote: null, checks: [], error: '评估已取消' }
+      }
+      const remote = await analyzeRemoteCandidate(remoteSpec, words, signal)
+      const checks = buildPolicyChecks(policy, locals, remote)
+      const languageBlocked = (l) => l !== undefined && checks.some((c) => c.rule === 'language' && c.status === 'fail' && c.detail.indexOf(l.path) >= 0)
+      for (const l of locals) {
+        if (l.error) continue
+        l.effort = effortOf(l.matchScore, l.lines, l.complexityPercent / 100, cfg)
+        if (languageBlocked(l)) {
+          l.verdict = 'not-suitable'
+        } else if (l.matchScore >= cfg.reuseThreshold && l.effort.level === 'low') {
+          l.verdict = 'direct-reuse'
+        } else if (l.matchScore >= cfg.adaptThreshold) {
+          l.verdict = 'adapt-reuse'
+        } else {
+          l.verdict = 'not-suitable'
+        }
+        l.reasons = []
+        if (l.matchScore >= cfg.reuseThreshold) l.reasons.push('与需求关键词高度重合（匹配 ' + l.matchScore + '/100）')
+        else if (l.matchScore >= cfg.adaptThreshold) l.reasons.push('与需求部分重合（匹配 ' + l.matchScore + '/100），需要适配')
+        else l.reasons.push('与需求重合度低（匹配 ' + l.matchScore + '/100）')
+        if (l.lines <= cfg.smallLines) l.reasons.push('代码量小（' + l.lines + ' 行），改造成本可控')
+        else if (l.lines <= cfg.mediumLines) l.reasons.push('代码量中等（' + l.lines + ' 行），改造需谨慎')
+        else l.reasons.push('代码量大（' + l.lines + ' 行），改造/维护成本高')
+        if (l.hasTest) l.reasons.push('存在对应测试文件，质量信号较好')
+        if (l.branches > 0) l.reasons.push('分支/条件 ' + l.branches + ' 处，复杂度 ' + l.complexityPercent + '%')
+      }
+      if (remote && !remote.error) {
+        remote.reasons = []
+        remote.reasons.push('描述匹配 ' + remote.matchScore + '/100')
+        const m = remote.lastUpdated || remote.lastPublish || ''
+        const mm = monthsSince(m)
+        if (mm !== null) remote.reasons.push('最近更新于 ' + mm + ' 个月前（' + (mm < 12 ? '维护活跃' : '维护沉寂') + '）')
+        remote.reasons.push((remote.stars || 0) + ' stars')
+        remote.reasons.push(remote.license ? '许可证 ' + remote.license : '许可证未知')
+      }
+      const usableLocal = locals.filter((l) => !l.error && l.verdict !== 'not-suitable')
+      const bestLocal = usableLocal.length > 0
+        ? usableLocal.sort((a, b) => (b.matchScore + (b.verdict === 'direct-reuse' ? 100 : 0)) - (a.matchScore + (a.verdict === 'direct-reuse' ? 100 : 0)))[0]
+        : undefined
+      const decision = decide(bestLocal, remote, cfg, checks)
+      return { words, policy, locals, remote, checks, bestLocal, decision }
+    }
 
     // ═══ 1. GitHub 仓库检索 ═══
     ctx.tools.register({
@@ -305,7 +719,6 @@ export default {
           })
           out.topReadme = rd.status === 200 && rd.body ? rd.body.slice(0, README_CHARS) : null
         }
-        markSearch(exec, results.length > 0)
         return out
       },
     })
@@ -414,7 +827,6 @@ export default {
         if (r.status !== 200) return apiError(r, 'GitLab 检索失败')
         const parsed = parseJson(r)
         if (!Array.isArray(parsed)) return { ok: false, status: r.status, message: 'GitLab 返回了无法解析的检索结果' }
-        markSearch(exec, parsed.length > 0)
         return {
           ok: true,
           provider: 'gitlab',
@@ -463,7 +875,6 @@ export default {
         const parsed = parseJson(r)
         if (!Array.isArray(parsed)) return { ok: false, status: r.status, message: 'Gitee 返回了无法解析的检索结果' }
         if (parsed.length === 0) {
-          markSearch(exec, false)
           return {
             ok: true,
             provider: 'gitee',
@@ -473,7 +884,6 @@ export default {
             note: 'Gitee 匿名 API 返回空结果（可能触发风控）。建议改用 github_reference_search 检索同类项目（多数知名项目在 GitHub 有同步仓库）。',
           }
         }
-        markSearch(exec, true)
         return {
           ok: true,
           provider: 'gitee',
@@ -522,7 +932,6 @@ export default {
         if (r.status !== 200) return apiError(r, 'npm 检索失败')
         const parsed = parseJson(r)
         if (!parsed || !Array.isArray(parsed.objects)) return { ok: false, status: r.status, message: 'npm 返回了无法解析的检索结果' }
-        markSearch(exec, parsed.objects.length > 0)
         return {
           ok: true,
           provider: 'npm',
@@ -549,36 +958,6 @@ export default {
     })
 
     // ═══ 6. 本地代码复用检索 ═══
-    function wordDefRegex(w) {
-      return new RegExp(
-        '^\\s*(?:'
-          + '(?:(?:export\\s+(?:default\\s+)?)?(?:async\\s+)?function\\s+\\w*' + w + '\\w*\\s*[(])'
-          + '|(?:(?:export\\s+)?(?:const|let|var)\\s+\\w*' + w + '\\w*\\s*=\\s*(?:async\\s*)?(?:\\w+\\s*=>|function|[(]))'
-          + '|(?:(?:export\\s+)?(?:abstract\\s+)?class\\s+\\w*' + w + '\\w*)'
-          + '|(?:(?:export\\s+)?(?:interface|type|enum)\\s+\\w*' + w + '\\w*)'
-          + '|(?:(?:async\\s+)?def\\s+\\w*' + w + '\\w*\\s*[(])'
-          + '|(?:class\\s+\\w*' + w + '\\w*)'
-          + '|(?:(?:pub\\s+)?(?:async\\s+)?fn\\s+\\w*' + w + '\\w*)'
-          + '|(?:(?:pub\\s+)?(?:struct|enum|trait|impl)\\s+\\w*' + w + '\\w*)'
-          + '|(?:func\\s+\\w*' + w + '\\w*\\s*[(])'
-          + '|(?:(?:public|private|protected)\\s+(?:static\\s+|final\\s+|abstract\\s+|async\\s+)*[\\w<>,.?\\[\\]\\s]*\\w*' + w + '\\w*\\s*[(])'
-          + '|(?:(?:public|private|protected)\\s+(?:static\\s+)?class\\s+\\w*' + w + '\\w*)'
-          + ')',
-        'i')
-    }
-
-    function wordLooseRegex(w) {
-      if (/^[a-zA-Z0-9_]+$/.test(w)) {
-        return new RegExp('^\\s*(?:export\\s+)?(?:const|let|var|function|class|interface|type|enum|def|fn|func|struct|trait|impl|public|private|protected|async|static)\\b[^\\n]{0,240}\\b' + w + '\\b', 'i')
-      }
-      return new RegExp('^\\s*(?:export\\s+)?(?:const|let|var|function|class|interface|type|enum|def|fn|func|struct|trait|impl|public|private|protected|async|static)\\b', 'i')
-    }
-
-    function queryWords(query) {
-      const words = (query.match(/[a-zA-Z0-9_\u4e00-\u9fa5]+/g) || []).map((w) => w.toLowerCase())
-      return words.filter((w) => w.length >= 2).slice(0, 8)
-    }
-
     ctx.tools.register({
       name: 'local_code_reuse_search',
       description:
@@ -600,99 +979,23 @@ export default {
       timeoutMs: 90000,
       presentCall: (args) => ({ card: 'generic', kind: 'read', title: '本地复用检索: ' + String((args && args.query) || '') }),
       async execute(args, exec) {
-        const query = safeQuery(args.query)
-        if (query === '') throw new Error('query 不能为空')
-        const words = queryWords(query)
-        if (words.length === 0) return { ok: false, message: 'query 中未找到有效关键词' }
+        const collected = await collectLocalCandidates(args.query, args.root, exec.signal)
+        if (collected.error) return { ok: false, message: collected.error }
         const maxResults = Math.min(20, Math.max(1, Number(args.maxResults) || 10))
-        const exts = new Set(String(args.fileTypes || '').split(',').map((e) => e.trim().toLowerCase().replace(/^\./, '')).filter(Boolean))
-        const allowedExts = exts.size > 0 ? exts : CODE_EXTS
-
-        let rootPath = String(args.root || '').trim()
-        if (!rootPath) {
-          const policy = ctx.get('sandboxPolicy')
-          rootPath = policy && policy.workspaceRoot ? policy.workspaceRoot : ''
-        }
-        if (!rootPath) return { ok: false, message: '未提供 root 且无法确定工作区根目录，请通过 root 参数指定绝对路径' }
-
-        let rootTarget
-        try {
-          rootTarget = await ctx.fs.resolve(rootPath, { signal: exec.signal })
-        } catch (error) {
-          return { ok: false, message: '无法解析检索根目录 ' + rootPath + ': ' + String((error && error.message) || error) }
-        }
-
-        const defRegexes = words.map((w) => ({ exact: wordDefRegex(w), loose: wordLooseRegex(w), word: w, ascii: /^[a-zA-Z0-9_]+$/.test(w) }))
-        const hits = []
-        let scannedBytes = 0
-
-        let collected
-        try {
-          collected = await collectFiles(rootTarget, allowedExts, exec.signal)
-        } catch (error) {
-          return { ok: false, message: String((error && error.message) || error) }
-        }
-
-        const readAndMatch = async (entry, path) => {
-          let text
-          try {
-            text = await ctx.fs.readText(entry.target, exec.signal)
-          } catch (error) {
-            return
-          }
-          if (text.indexOf('\u0000') >= 0) return
-          scannedBytes += Math.min(text.length, MAX_FILE_BYTES)
-          const lines = text.split('\n')
-          const limit = Math.min(lines.length, 20000)
-          for (let i = 0; i < limit; i++) {
-            const line = lines[i]
-            let score = 0
-            for (const d of defRegexes) {
-              if (d.exact.test(line)) {
-                score = Math.max(score, 2)
-              } else if (d.loose.test(line) && (d.ascii || line.indexOf(d.word) >= 0)) {
-                score = Math.max(score, 1)
-              }
-            }
-            if (score > 0) {
-              hits.push({
-                path,
-                line: i + 1,
-                lineText: line.trim().slice(0, 220),
-                score,
-                context: [
-                  i > 0 ? lines[i - 1].trim().slice(0, 160) : '',
-                  i + 1 < limit ? lines[i + 1].trim().slice(0, 160) : '',
-                ],
-              })
-            }
-          }
-        }
-
-        const pending = collected.pending
-        for (let i = 0; i < pending.length; i += 8) {
-          if (exec.signal && exec.signal.aborted) return { ok: false, message: '检索已取消' }
-          await Promise.all(pending.slice(i, i + 8).map((p) => readAndMatch(p.entry, p.path)))
-        }
-
-        const sorted = hits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path) || a.line - b.line)
-        markSearch(exec, hits.length > 0)
         return {
           ok: true,
           provider: 'local',
-          query,
-          root: (() => {
-            try {
-              return ctx.fs.processPath(rootTarget)
-            } catch (error) {
-              return rootPath
-            }
-          })(),
-          scannedFiles: pending.length,
-          scannedBytes,
+          query: safeQuery(args.query),
+          root: collected.root || '',
+          scannedFiles: collected.scanned,
           truncated: collected.truncated,
-          matchCount: hits.length,
-          matches: sorted.slice(0, maxResults),
+          matchCount: collected.candidates.length,
+          matches: collected.candidates.slice(0, maxResults).map((c) => ({
+            path: c.path,
+            line: c.line,
+            lineText: c.lineText,
+            score: c.score,
+          })),
         }
       },
     })
@@ -915,317 +1218,7 @@ export default {
       },
     })
 
-    // ═══ 8. 复用价值评估：可调阈值 + 公司政策 ═══
-    const STOPWORDS = new Set(['the', 'and', 'with', 'for', 'from', 'this', 'that', 'using', 'use', 'used', 'make', 'create', 'provide', 'based', 'via', 'tool', 'utility', 'module', 'function', 'component', 'support', 'supports', 'like', 'into', 'your', 'our', 'can', 'will', 'does', 'would', 'should', 'need', 'needs', 'want', 'feature', 'features', 'system', 'also', 'all', 'any', 'are', 'was', 'were', 'been', 'has', 'have', 'had', 'its', 'them', 'their', 'there', 'where', 'which', 'when', 'what', 'who', 'how', 'why', 'but', 'not', 'only', 'just', 'more', 'most', 'some', 'such', 'than', 'then', 'other', 'others'])
-
-    function assessWords(query) {
-      return queryWords(query).filter((w) => w.length >= 3 && !STOPWORDS.has(w))
-    }
-
-    function matchScoreOf(path, text, words) {
-      const asciiWords = words.filter((w) => /^[a-zA-Z0-9_]+$/.test(w))
-      const cjkWords = words.filter((w) => !/^[a-zA-Z0-9_]+$/.test(w))
-      const head = text.slice(0, 4000).toLowerCase()
-      const base = path.split('/').pop().replace(/\.[^.]+$/, '')
-      const nameTokens = base.split(/[^a-zA-Z0-9]+/).filter(Boolean).map((t) => t.toLowerCase())
-      if (asciiWords.length > 0) {
-        let contentHits = 0
-        for (const w of asciiWords) if (head.indexOf(w) >= 0) contentHits++
-        let nameHits = 0
-        for (const w of asciiWords) {
-          if (nameTokens.some((t) => t.indexOf(w) >= 0 || w.indexOf(t) >= 0)) nameHits++
-        }
-        let cjkHits = 0
-        for (const w of cjkWords) if (head.indexOf(w) >= 0) cjkHits++
-        const contentPart = 70 * (contentHits / Math.max(1, asciiWords.length))
-        const namePart = 30 * (nameHits / Math.max(1, asciiWords.length))
-        const cjkBonus = cjkHits > 0 ? 10 : 0
-        return Math.min(100, Math.round(contentPart + namePart + cjkBonus))
-      }
-      if (cjkWords.length > 0) {
-        let cjkHits = 0
-        for (const w of cjkWords) if (head.indexOf(w) >= 0) cjkHits++
-        return Math.min(100, Math.round(100 * (cjkHits / cjkWords.length)))
-      }
-      return 0
-    }
-
-    function effortOf(match, lines, complexity, cfg) {
-      if (match >= cfg.reuseThreshold && lines <= cfg.smallLines && complexity <= cfg.maxComplexityPercent / 100) {
-        return { level: 'low', estimate: '约 0.5–2 小时' }
-      }
-      if (match >= cfg.adaptThreshold || lines <= cfg.mediumLines) {
-        return { level: 'medium', estimate: '约 2 小时–1 天' }
-      }
-      return { level: 'high', estimate: '约 1–3 天' }
-    }
-
-    const EXT_LANG = { ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript', py: 'python', go: 'go', rs: 'rust', java: 'java', kt: 'kotlin', kts: 'kotlin', c: 'c', cpp: 'c++', cc: 'c++', h: 'c', hpp: 'c++', cs: 'c#', php: 'php', rb: 'ruby', swift: 'swift', sh: 'shell', vue: 'vue', svelte: 'svelte', dart: 'dart', scala: 'scala', sql: 'sql', groovy: 'groovy' }
-    const extToLanguage = (path) => {
-      const dot = path.lastIndexOf('.')
-      const ext = dot >= 0 ? path.slice(dot + 1).toLowerCase() : ''
-      return EXT_LANG[ext] || ext
-    }
-
-    function normalizePolicy(d) {
-      return {
-        allowedLicenses: Array.isArray(d.allowedLicenses) ? d.allowedLicenses.map(String) : [],
-        blockedLanguages: Array.isArray(d.blockedLanguages) ? d.blockedLanguages.map(String).map((s) => s.toLowerCase()) : [],
-        requireTests: d.requireTests === true,
-        minCommentRatio: Number(d.minCommentRatio) > 0 ? Number(d.minCommentRatio) : 0,
-      }
-    }
-
-    async function loadPolicy(policyPath, localPaths, signal) {
-      const candidates = []
-      const explicit = String(policyPath || '').trim()
-      if (explicit) candidates.push(explicit)
-      const policy = ctx.get('sandboxPolicy')
-      const ws = policy && policy.workspaceRoot ? policy.workspaceRoot : ''
-      if (ws) candidates.push(ws + '/.code-reference-policy.json')
-      for (const p of localPaths) {
-        let dir = p.slice(0, p.lastIndexOf('/'))
-        for (let i = 0; i < 3 && dir.length > 1; i++) {
-          candidates.push(dir + '/.code-reference-policy.json')
-          const s = dir.lastIndexOf('/')
-          if (s <= 0) break
-          dir = dir.slice(0, s)
-        }
-      }
-      const seen = new Set()
-      for (const path of candidates) {
-        if (seen.has(path)) continue
-        seen.add(path)
-        let target
-        try {
-          target = await ctx.fs.resolve(path, { signal })
-        } catch (error) {
-          continue
-        }
-        let info
-        try {
-          info = await ctx.fs.stat(target, signal)
-        } catch (error) {
-          continue
-        }
-        if (!info) continue
-        let text
-        try {
-          text = await ctx.fs.readText(target, signal)
-        } catch (error) {
-          continue
-        }
-        try {
-          const data = JSON.parse(text)
-          return { source: path, data: normalizePolicy(data), note: '已加载公司政策文件 ' + path }
-        } catch (error) {
-          return { source: path, data: null, note: '政策文件不是合法 JSON，使用宽松默认：' + String((error && error.message) || error) }
-        }
-      }
-      const tried = Array.from(seen).join('、')
-      return { source: tried || null, data: null, note: '未找到政策文件（尝试：' + (tried || '无') + '），使用宽松默认（不限制许可证/语言/测试）' }
-    }
-
-    function buildPolicyChecks(policy, locals, remote) {
-      const checks = []
-      const p = policy && policy.data
-      if (!p) return checks
-      if (p.blockedLanguages.length > 0) {
-        for (const l of locals) {
-          if (!l.error) {
-            const lang = extToLanguage(l.path)
-            if (p.blockedLanguages.indexOf(lang) >= 0) {
-              checks.push({ rule: 'language', status: 'fail', detail: '候选 ' + l.path + ' 使用语言 ' + lang + '，在公司禁止语言列表中' })
-            }
-          }
-        }
-      }
-      if (p.allowedLicenses.length > 0 && remote && !remote.error && remote.license) {
-        const ok = p.allowedLicenses.some((x) => String(x).toLowerCase() === String(remote.license).toLowerCase())
-        if (!ok) {
-          checks.push({ rule: 'license', status: 'fail', detail: '候选许可证 ' + remote.license + ' 不在公司允许列表（' + p.allowedLicenses.join(', ') + '）中' })
-        }
-      }
-      if (p.requireTests) {
-        for (const l of locals) {
-          if (!l.error && !l.hasTest) {
-            checks.push({ rule: 'tests', status: 'warn', detail: '候选 ' + l.path + ' 缺少测试文件，而公司要求测试覆盖；复用后需补充测试' })
-          }
-        }
-      }
-      if (p.minCommentRatio > 0) {
-        for (const l of locals) {
-          if (!l.error && l.commentRatio < Math.round(p.minCommentRatio * 100)) {
-            checks.push({ rule: 'comments', status: 'warn', detail: '候选 ' + l.path + ' 注释比 ' + l.commentRatio + '% 低于公司要求 ' + Math.round(p.minCommentRatio * 100) + '%' })
-          }
-        }
-      }
-      return checks
-    }
-
-    async function analyzeLocalCandidate(path, words, signal) {
-      let target
-      try {
-        target = await ctx.fs.resolve(path, { signal })
-      } catch (error) {
-        return { path, error: '无法解析路径: ' + String((error && error.message) || error) }
-      }
-      let text
-      try {
-        text = await ctx.fs.readText(target, signal)
-      } catch (error) {
-        return { path, error: '读取失败: ' + String((error && error.message) || error) }
-      }
-      if (text.indexOf('\u0000') >= 0) return { path, error: '二进制文件，跳过' }
-      const lines = text.split('\n')
-      const total = lines.length
-      let comment = 0
-      let branches = 0
-      let declarations = 0
-      for (const l of lines) {
-        const t = l.trim()
-        if (!t) continue
-        if (t.startsWith('//') || t.startsWith('#') || t.startsWith('*') || t.startsWith('/*') || t.startsWith('--') || t.startsWith(';')) comment++
-        if (/\b(if|switch|case|for|while|catch)\b/.test(t) || t.indexOf('?') >= 0) branches++
-        if (/\b(function|class|def|fn|func|const|let|var|interface|type|enum|struct|impl|public|private)\b/.test(t)) declarations++
-      }
-      const match = matchScoreOf(path, text, words)
-      const complexity = branches / Math.max(1, total)
-
-      let hasTest = false
-      try {
-        const slash = path.lastIndexOf('/')
-        const dirPath = slash >= 0 ? path.slice(0, slash) : path
-        const dirTarget = await ctx.fs.resolve(dirPath, { signal })
-        const entries = await ctx.fs.listDir(dirTarget, signal)
-        const baseName = path.slice(slash + 1).replace(/\.[^.]+$/, '')
-        hasTest = entries.some((e) => e.type === 'file' && e.name.startsWith(baseName) && (e.name.indexOf('.test.') >= 0 || e.name.indexOf('.spec.') >= 0 || e.name.indexOf('_test.') >= 0))
-      } catch (error) { /* 忽略 */ }
-
-      return {
-        path,
-        language: extToLanguage(path),
-        lines: total,
-        commentRatio: Math.round((100 * comment) / Math.max(1, total)),
-        branches,
-        declarations,
-        matchScore: match,
-        complexityPercent: Math.round(complexity * 100),
-        hasTest,
-        reasons: [],
-      }
-    }
-
-    async function analyzeRemoteCandidate(spec, words, signal) {
-      if (!spec) return null
-      const s = String(spec).trim()
-      if (s.startsWith('npm:')) {
-        const name = s.slice(4).trim()
-        const r = await apiRequest('https://registry.npmjs.org/' + encodeURIComponent(name), { signal })
-        if (r.status !== 200) return { spec: s, error: 'npm 查询失败（HTTP ' + r.status + '）' }
-        const m = parseJson(r)
-        if (!m) return { spec: s, error: 'npm 返回无法解析的数据' }
-        const latest = m['dist-tags'] && m['dist-tags'].latest ? m['dist-tags'].latest : ''
-        const version = latest && m.versions && m.versions[latest] ? m.versions[latest] : {}
-        const desc = String(m.description || '').toLowerCase()
-        const asciiWords = words.filter((w) => /^[a-zA-Z0-9_]+$/.test(w))
-        let hits = 0
-        for (const w of asciiWords) if (desc.indexOf(w) >= 0) hits++
-        const match = Math.round((100 * hits) / Math.max(1, asciiWords.length))
-        const published = version.date || (m.time && m.time[latest]) || ''
-        const months = monthsSince(published)
-        return {
-          spec: s,
-          kind: 'npm',
-          name,
-          version: latest,
-          description: m.description || '',
-          license: version.license || '',
-          matchScore: match,
-          lastPublish: published || '',
-          active: months !== null && months < 12,
-        }
-      }
-      const clean = s.replace(/^https?:\/\//, '').replace(/^github\.com\//, '').replace(/\/$/, '')
-      const parts = clean.split('/').filter(Boolean)
-      if (parts.length < 2) return { spec: s, error: '无法识别的仓库格式（应为 owner/repo 或 https://github.com/owner/repo）' }
-      const owner = parts[0].replace(/[^\w.-]/g, '')
-      const repo = parts[1].replace(/[^\w.-]/g, '')
-      const r = await apiRequest('https://api.github.com/repos/' + owner + '/' + repo, { signal })
-      if (r.status === 404) return { spec: s, error: '仓库不存在或为私有' }
-      if (r.status !== 200) return { spec: s, error: 'GitHub 查询失败（HTTP ' + r.status + '）' }
-      const m = parseJson(r)
-      if (!m) return { spec: s, error: 'GitHub 返回无法解析的数据' }
-      const desc = String(m.description || '').toLowerCase()
-      const asciiWords = words.filter((w) => /^[a-zA-Z0-9_]+$/.test(w))
-      let hits = 0
-      for (const w of asciiWords) if (desc.indexOf(w) >= 0) hits++
-      const match = Math.round((100 * hits) / Math.max(1, asciiWords.length))
-      const months = monthsSince(m.updated_at || '')
-      return {
-        spec: s,
-        kind: 'github',
-        fullName: m.full_name || owner + '/' + repo,
-        description: m.description || '',
-        stars: m.stargazers_count || 0,
-        license: m.license && m.license.spdx_id ? m.license.spdx_id : '',
-        matchScore: match,
-        lastUpdated: m.updated_at || '',
-        active: months !== null && months < 12,
-      }
-    }
-
-    function monthsSince(iso) {
-      if (!iso) return null
-      const t = Date.parse(iso)
-      if (Number.isNaN(t)) return null
-      return Math.max(0, Math.round((Date.now() - t) / (1000 * 60 * 60 * 24 * 30)))
-    }
-
-    function decide(localBest, remote, cfg, checks) {
-      const licenseBlocked = checks.some((c) => c.rule === 'license' && c.status === 'fail')
-      const languageBlocked = (l) => l !== undefined && checks.some((c) => c.rule === 'language' && c.status === 'fail' && c.detail.indexOf(l.path) >= 0)
-      const testsRequired = checks.some((c) => c.rule === 'tests' && c.status === 'warn')
-
-      if (localBest && !languageBlocked(localBest)) {
-        const needsTests = testsRequired && !localBest.hasTest
-        if (localBest.matchScore >= cfg.reuseThreshold && localBest.effort.level === 'low') {
-          if (needsTests) {
-            return {
-              choice: 'adapt',
-              confidence: 'medium',
-              reason: '本地候选匹配度 ' + localBest.matchScore + '>= ' + cfg.reuseThreshold + ' 且改造成本低（' + localBest.effort.estimate + '），但公司政策要求测试覆盖而候选缺少测试：建议复用并补充测试后交付。',
-            }
-          }
-          return {
-            choice: 'reuse',
-            confidence: 'high',
-            reason: '本地候选匹配度 ' + localBest.matchScore + '>= ' + cfg.reuseThreshold + ' 且改造成本低（' + localBest.effort.estimate + '），复用总成本显著低于自制，建议直接复用。',
-          }
-        }
-        if (localBest.matchScore >= cfg.adaptThreshold) {
-          return {
-            choice: 'adapt',
-            confidence: 'medium',
-            reason: '本地候选匹配度 ' + localBest.matchScore + '（阈值 ' + cfg.adaptThreshold + '），需改造（' + localBest.effort.estimate + '）。若改造工作量小于从零实现（同规模约 2-3 倍于改造工作量），建议改造复用；否则自制。' + (needsTests ? '注意：公司要求测试覆盖，改造时需补测试。' : ''),
-          }
-        }
-      }
-      if (remote && !remote.error && !licenseBlocked && remote.matchScore >= cfg.remoteThreshold && remote.active) {
-        return {
-          choice: 'dependency',
-          confidence: 'medium',
-          reason: '开源候选维护活跃且描述匹配（' + remote.matchScore + '>= ' + cfg.remoteThreshold + '），引入依赖通常优于自制；许可证 ' + (remote.license || '未知') + ' 已通过公司政策检查。',
-        }
-      }
-      const policyNote = licenseBlocked ? '（候选许可证未通过公司政策检查，已排除）' : ''
-      return {
-        choice: 'rewrite',
-        confidence: 'high',
-        reason: '未找到匹配度足够高、改造成本足够低的候选，或候选被公司政策排除' + policyNote + '；从零实现的成本低于复用的总成本，建议自制。',
-      }
-    }
-
+    // ═══ 8. 复用价值评估 ═══
     ctx.tools.register({
       name: 'reuse_value_assessment',
       description:
@@ -1235,7 +1228,7 @@ export default {
         + '对开源候选量化：描述匹配度、维护活跃度（最近更新距今）、许可证、star。'
         + '阈值可调：reuseThreshold（默认 70）/ adaptThreshold（默认 40）/ remoteThreshold（默认 50）/ smallLines（默认 300）/ mediumLines（默认 800）/ maxComplexityPercent（默认 12）。'
         + '支持公司政策：默认按顺序查找 显式 policyPath → 工作区根 → 本地候选目录向上 3 层的 .code-reference-policy.json，'
-        + '字段：allowedLicenses（许可证白名单）、blockedLanguages（禁止语言）、requireTests（必须带测试）、minCommentRatio（最低注释比 0-1）。'
+        + '字段：allowedLicenses（许可证白名单）、blockedLanguages（禁止语言）、requireTests（必须带测试）、minCommentRatio（最低注释比 0-1）、reuseMode（ask 询问 / auto 自动优先复用）。'
         + '输出决策：reuse（直接复用）/ adapt（改造复用）/ dependency（引入依赖）/ rewrite（自制）。'
         + '提示：requirement 描述建议同时包含英文术语关键词，中文词对英文代码库的匹配信号较弱。',
       parameters: {
@@ -1262,109 +1255,215 @@ export default {
         if (requirement === '') throw new Error('requirement 不能为空')
         const words = assessWords(requirement)
         if (words.length === 0) return { ok: false, message: 'requirement 中未找到有效关键词（描述过短或全为停用词）' }
-
-        const cfg = {
-          reuseThreshold: Math.min(100, Math.max(1, Number(args.reuseThreshold) || 70)),
-          adaptThreshold: Math.min(100, Math.max(1, Number(args.adaptThreshold) || 40)),
-          remoteThreshold: Math.min(100, Math.max(1, Number(args.remoteThreshold) || 50)),
-          smallLines: Math.max(1, Number(args.smallLines) || 300),
-          mediumLines: Math.max(1, Number(args.mediumLines) || 800),
-          maxComplexityPercent: Math.min(100, Math.max(1, Number(args.maxComplexityPercent) || 12)),
-        }
-        if (cfg.adaptThreshold > cfg.reuseThreshold) cfg.adaptThreshold = cfg.reuseThreshold
-
+        const cfg = defaultConfig(args)
         const localPaths = String(args.localCandidates || '').split(',').map((p) => p.trim()).filter(Boolean).slice(0, 5)
-        const policy = await loadPolicy(args.policyPath, localPaths, exec.signal)
-
-        const locals = []
-        for (const p of localPaths) {
-          const a = await analyzeLocalCandidate(p, words, exec.signal)
-          locals.push(a)
-          if (exec.signal && exec.signal.aborted) return { ok: false, message: '评估已取消' }
-        }
-        const remote = await analyzeRemoteCandidate(args.remoteCandidate, words, exec.signal)
-
-        const checks = buildPolicyChecks(policy, locals, remote)
-        const languageBlocked = (l) => l !== undefined && checks.some((c) => c.rule === 'language' && c.status === 'fail' && c.detail.indexOf(l.path) >= 0)
-        for (const l of locals) {
-          if (l.error) continue
-          l.effort = effortOf(l.matchScore, l.lines, l.complexityPercent / 100, cfg)
-          if (languageBlocked(l)) {
-            l.verdict = 'not-suitable'
-          } else if (l.matchScore >= cfg.reuseThreshold && l.effort.level === 'low') {
-            l.verdict = 'direct-reuse'
-          } else if (l.matchScore >= cfg.adaptThreshold) {
-            l.verdict = 'adapt-reuse'
-          } else {
-            l.verdict = 'not-suitable'
-          }
-          l.reasons = []
-          if (l.matchScore >= cfg.reuseThreshold) l.reasons.push('与需求关键词高度重合（匹配 ' + l.matchScore + '/100）')
-          else if (l.matchScore >= cfg.adaptThreshold) l.reasons.push('与需求部分重合（匹配 ' + l.matchScore + '/100），需要适配')
-          else l.reasons.push('与需求重合度低（匹配 ' + l.matchScore + '/100）')
-          if (l.lines <= cfg.smallLines) l.reasons.push('代码量小（' + l.lines + ' 行），改造成本可控')
-          else if (l.lines <= cfg.mediumLines) l.reasons.push('代码量中等（' + l.lines + ' 行），改造需谨慎')
-          else l.reasons.push('代码量大（' + l.lines + ' 行），改造/维护成本高')
-          if (l.hasTest) l.reasons.push('存在对应测试文件，质量信号较好')
-          if (l.branches > 0) l.reasons.push('分支/条件 ' + l.branches + ' 处，复杂度 ' + l.complexityPercent + '%')
-        }
-        if (remote && !remote.error) {
-          remote.reasons = []
-          remote.reasons.push('描述匹配 ' + remote.matchScore + '/100')
-          const m = remote.lastUpdated || remote.lastPublish || ''
-          const mm = monthsSince(m)
-          if (mm !== null) remote.reasons.push('最近更新于 ' + mm + ' 个月前（' + (mm < 12 ? '维护活跃' : '维护沉寂') + '）')
-          remote.reasons.push((remote.stars || 0) + ' stars')
-          remote.reasons.push(remote.license ? '许可证 ' + remote.license : '许可证未知')
-        }
-
-        const usableLocal = locals.filter((l) => !l.error && l.verdict !== 'not-suitable')
-        const bestLocal = usableLocal.length > 0
-          ? usableLocal.sort((a, b) => (b.matchScore + (b.verdict === 'direct-reuse' ? 100 : 0)) - (a.matchScore + (a.verdict === 'direct-reuse' ? 100 : 0)))[0]
-          : undefined
-        const decision = decide(bestLocal, remote, cfg, checks)
-        markAssessed(exec)
-
+        const result = await assessCandidates(requirement, localPaths, args.remoteCandidate, cfg, exec.signal)
+        if (result.error) return { ok: false, message: result.error }
         return {
           ok: true,
           provider: 'reuse-assessment',
           requirement,
           thresholds: cfg,
           judgmentStandard: '复用价值判断标准（当前阈值）：1) 匹配度 >=' + cfg.reuseThreshold + ' 且改造成本低 → 直接复用；2) 匹配度 ' + cfg.adaptThreshold + '-' + (cfg.reuseThreshold - 1) + ' → 改造复用（改造工作量 < 从零实现的 1/2 时划算）；3) 开源候选维护活跃且匹配 >=' + cfg.remoteThreshold + ' → 引入依赖（需通过公司许可证政策）；4) 其余情况 → 自制。阈值可通过工具参数调整。',
-          policy,
-          policyChecks: checks,
-          localCandidates: locals,
-          remoteCandidate: remote,
-          decision,
+          policy: result.policy,
+          policyChecks: result.checks,
+          localCandidates: result.locals,
+          remoteCandidate: result.remote,
+          decision: result.decision,
         }
       },
     })
 
-    // ═══ 系统提示词：工程规范 + 强制机制 + 判断标准 ═══
+    // ═══ 9. 复用调查：调查 → 价值权衡 → 询问用户 ═══
+    ctx.tools.register({
+      name: 'reuse_survey',
+      description:
+        '复用调查（需求澄清后调用）：先自动调查本地代码库与开源平台的可复用候选并评估价值权衡，'
+        + '然后把"候选清单 + 价值对比"呈现给用户并询问是否复用（用户可选择复用哪个候选/改造/不复用直接开发）。'
+        + '若政策文件配置 reuseMode="auto"（或传 ask=false）则不询问，直接采用评估给出的推荐决策（优先复用）。'
+        + '适合在澄清需求之后、开始写代码之前调用一次。',
+      parameters: {
+        type: 'object',
+        properties: {
+          requirement: { type: 'string', description: '目标需求/功能描述（建议含英文术语关键词），调查与评估的基准' },
+          root: { type: 'string', description: '本地检索根目录（绝对路径）；省略时使用当前工作区根目录' },
+          remoteSearch: { type: 'boolean', default: true, description: '是否同时调查开源平台（GitHub/npm 等），默认 true' },
+          ask: { type: 'boolean', description: '是否询问用户；省略时读政策 reuseMode（默认询问）；false 时不询问直接返回推荐决策' },
+          reuseThreshold: { type: 'integer', description: '直接复用匹配度阈值，默认 70' },
+          adaptThreshold: { type: 'integer', description: '改造复用匹配度阈值，默认 40' },
+          remoteThreshold: { type: 'integer', description: '远程候选匹配度阈值，默认 50' },
+        },
+        required: ['requirement'],
+      },
+      output: { schema: { type: 'json' }, render: renderJson },
+      timeoutMs: 120000,
+      presentCall: (args) => ({ card: 'generic', kind: 'read', title: '复用调查: ' + String((args && args.requirement) || '') }),
+      async execute(args, exec) {
+        const requirement = safeQuery(args.requirement)
+        if (requirement === '') throw new Error('requirement 不能为空')
+        const cfg = defaultConfig(args)
+
+        // 1) 本地调查
+        const local = await collectLocalCandidates(requirement, args.root, exec.signal)
+        if (local.error) return { ok: false, message: local.error }
+        const localPaths = local.candidates.slice(0, 5).map((c) => c.path)
+
+        // 2) 开源调查（GitHub 为主）
+        let remoteSpec
+        if (args.remoteSearch !== false) {
+          const query = safeQuery(args.requirement)
+          const r = await apiRequest('https://api.github.com/search/repositories?q='
+            + encodeURIComponent(query + ' archived:false') + '&sort=stars&order=desc&per_page=5',
+            { signal: exec.signal })
+          if (r.error === undefined && r.status === 200) {
+            const parsed = parseJson(r)
+            if (parsed && Array.isArray(parsed.items) && parsed.items.length > 0) {
+              const top = parsed.items[0]
+              remoteSpec = top.full_name
+            }
+          }
+        }
+
+        // 3) 价值权衡评估
+        const result = await assessCandidates(requirement, localPaths, remoteSpec, cfg, exec.signal)
+        if (result.error) return { ok: false, message: result.error }
+
+        // 4) 权衡摘要
+        const lines = []
+        lines.push('需求：' + requirement)
+        if (result.locals.length > 0) {
+          lines.push('本地候选（' + result.locals.length + ' 个）：')
+          for (const l of result.locals) {
+            if (l.error) {
+              lines.push('  - ' + l.path + '：' + l.error)
+              continue
+            }
+            lines.push('  - ' + l.path + '：匹配 ' + l.matchScore + '/100，' + l.lines + ' 行，改造 ' + (l.effort ? l.effort.estimate : '未知') + '，判定 ' + (l.verdict || 'n/a'))
+          }
+        } else {
+          lines.push('本地未发现相关候选。')
+        }
+        if (result.remote && !result.remote.error) {
+          lines.push('开源候选：' + (result.remote.fullName || result.remote.name) + '（匹配 ' + result.remote.matchScore + '/100，' + (result.remote.active ? '维护活跃' : '维护沉寂') + '，许可证 ' + (result.remote.license || '未知') + '，' + (result.remote.stars || 0) + ' stars）')
+        } else if (args.remoteSearch !== false) {
+          lines.push('开源平台未发现合适候选。')
+        }
+        if (result.policy && result.policy.note) lines.push('政策：' + result.policy.note)
+        for (const c of result.checks) lines.push('政策检查[' + c.status + '] ' + c.detail)
+        lines.push('推荐决策：' + result.decision.choice + '（' + result.decision.confidence + '）— ' + result.decision.reason)
+        const summary = lines.join('\n')
+
+        // 5) 询问用户（或按政策/参数跳过）
+        const policyMode = result.policy && result.policy.data ? result.policy.data.reuseMode : 'ask'
+        const shouldAsk = args.ask === undefined ? policyMode !== 'auto' : args.ask === true
+
+        let answer = null
+        if (shouldAsk) {
+          const uq = ctx.get('userQuestions')
+          if (uq === undefined) {
+            return {
+              ok: true,
+              provider: 'reuse-survey',
+              requirement,
+              mode: 'auto-fallback',
+              note: '用户询问服务不可用（当前上下文无法询问），已按推荐决策返回',
+              survey: summary,
+              localCandidates: result.locals,
+              remoteCandidate: result.remote,
+              policyChecks: result.checks,
+              decision: result.decision,
+            }
+          }
+          const options = []
+          for (const l of result.locals) {
+            if (l.error || l.verdict === 'not-suitable') continue
+            const base = l.path.split('/').pop()
+            options.push({
+              label: '复用本地 ' + base + '（匹配 ' + l.matchScore + '/100，' + (l.effort ? l.effort.estimate : '') + '）',
+              description: l.path,
+            })
+          }
+          if (result.remote && !result.remote.error) {
+            options.push({
+              label: '复用开源 ' + (result.remote.fullName || result.remote.name) + '（匹配 ' + result.remote.matchScore + '/100）',
+              description: '许可证 ' + (result.remote.license || '未知') + '，' + (result.remote.stars || 0) + ' stars',
+            })
+          }
+          options.push({ label: '不复用，直接开发', description: '按从零实现处理（评估建议为 rewrite 时的默认选项）' })
+          try {
+            const askResult = await Promise.race([
+              (async () => {
+                const res = await uq.ask({
+                  questions: [{
+                    id: 'reuse-choice',
+                    header: '复用调查结果',
+                    question: '是否需要复用已有代码？以下是调查与价值权衡：',
+                    detail: summary,
+                    options,
+                  }],
+                  agent: exec.agent,
+                  signal: exec.signal,
+                })
+                const item = res && res.answers && res.answers[0]
+                return item ? { selected: item.selected || [], custom: item.custom || '' } : null
+              })(),
+              new Promise((resolve) => {
+                ctx.timeout(() => resolve({ timeout: true }), 90000)
+              }),
+            ])
+            if (askResult && askResult.timeout) {
+              answer = { error: '等待用户回答超时（90 秒）。若当前上下文无法询问用户，请用 ask=false 跳过询问。' }
+            } else {
+              answer = askResult
+            }
+          } catch (error) {
+            answer = { error: String((error && error.message) || error) }
+          }
+        }
+
+        return {
+          ok: true,
+          provider: 'reuse-survey',
+          requirement,
+          mode: shouldAsk ? 'ask' : 'auto',
+          survey: summary,
+          localCandidates: result.locals,
+          remoteCandidate: result.remote,
+          policyChecks: result.checks,
+          decision: result.decision,
+          answer,
+        }
+      },
+    })
+
+    // ═══ 系统提示词：需求澄清后调查并询问，不再机械拦截 ═══
     ctx.systemPrompt.section({
       name: 'tool:code-reference',
       order: 120,
       text:
-        'ENGINEERING PRINCIPLES ENFORCED BY THIS HARNESS (code-reference):\n'
-        + '1. REUSE BEFORE WRITE (mechanically enforced, two gates). Gate 1: the system DENIES creating new files until '
-        + 'this session has run a reuse search (local_code_reuse_search first, then platform searches for new '
-        + 'projects/components: github_reference_search / gitlab_reference_search / gitee_reference_search / '
-        + 'npm_reference_search). Gate 2: when a search found candidates, the system DENIES writing until you have '
-        + 'called reuse_value_assessment (requirement + localCandidates/remoteCandidate) to judge whether reuse is '
-        + 'actually worth more than writing from scratch. Judgment standard: reuse only when its total cost '
-        + '(adaptation work + quality risk + integration) is clearly below writing from scratch — matchScore >=70 '
-        + 'with low adaptation effort means reuse; 40-69 means adapt (worthwhile when adaptation < half the rewrite); '
-        + 'active + well-matching open-source candidate means dependency; otherwise rewrite is the right call and '
-        + 'the write proceeds. Thresholds are adjustable via the tool parameters; a company policy file '
-        + '(.code-reference-policy.json in the workspace root, or policyPath) may restrict licenses, languages, '
-        + 'and require tests — honor policyChecks failures.\n'
-        + '2. HIGH COHESION / LOW COUPLING. Keep every module focused on one responsibility; depend on abstractions, not '
-        + 'implementations; never create circular imports; keep cross-module surface minimal; extract shared logic '
-        + 'instead of duplicating it; prefer small, composable modules over large god-modules.\n'
-        + '3. ARCHITECTURE SELF-CHECK. After completing a module or project, run code_architecture_review on it and fix '
-        + 'reported cycles, oversized modules, or coupling hotspots before declaring the work done.\n'
-        + '4. LICENSE COMPLIANCE. Reuse is advisory: respect each repository/package license (returned as the license '
-        + 'field), never copy code unless the license permits it, and prefer maintained, actively updated projects.',
+        'CODE REUSE WORKFLOW (code-reference):\n'
+        + '1. CLARIFY REQUIREMENTS FIRST, THEN SURVEY, THEN ASK. When the user asks you to develop a new project, '
+        + 'component, or feature, first clarify the requirements (scope, language, constraints). After the '
+        + 'requirements are clear, run the reuse_survey tool once before writing code: it investigates the local '
+        + 'codebase (local_code_reuse_search logic) and open-source platforms (GitHub etc.), evaluates the '
+        + 'reuse-vs-rewrite value tradeoff (reuse_value_assessment logic), and then ASKS the user which candidate '
+        + 'to reuse (or whether to skip reuse and build from scratch) with the tradeoffs shown. Follow the user\'s '
+        + 'choice. If the company policy file (.code-reference-policy.json) sets reuseMode="auto" (or the user '
+        + 'prefers no asking), skip the question and adopt the recommended decision directly, preferring reuse.\n'
+        + '2. You may also call the individual tools directly when needed: local_code_reuse_search, '
+        + 'github_reference_search / github_repo_reference / gitlab_reference_search / gitee_reference_search / '
+        + 'npm_reference_search for searching, reuse_value_assessment for a standalone value judgment. Judgment '
+        + 'standard: reuse only when its total cost (adaptation + risk + integration) is clearly below rewriting — '
+        + 'matchScore >=70 with low adaptation effort means reuse; 40-69 means adapt (worthwhile when adaptation '
+        + '< half the rewrite); active + well-matching open-source candidate means dependency; otherwise rewrite. '
+        + 'Thresholds are adjustable; a company policy file may restrict licenses/languages and require tests.\n'
+        + '3. HIGH COHESION / LOW COUPLING. Keep every module focused on one responsibility; depend on abstractions, '
+        + 'not implementations; never create circular imports; keep cross-module surface minimal; extract shared '
+        + 'logic instead of duplicating it; prefer small, composable modules over large god-modules.\n'
+        + '4. ARCHITECTURE SELF-CHECK. After completing a module or project, run code_architecture_review on it and '
+        + 'fix reported cycles, oversized modules, or coupling hotspots before declaring the work done.\n'
+        + '5. LICENSE COMPLIANCE. Reuse is advisory: respect each repository/package license (returned as the '
+        + 'license field), never copy code unless the license permits it, and prefer maintained, actively updated projects.',
     })
   },
 }
