@@ -4,10 +4,12 @@ DeepSeek Harness (DSH) 代码参考检索与工程规范插件：在**厘清需�
 
 除"内容级"复用（相似的函数/组件/项目）外，还支持**架构级复用**：扫描本地已有的业务系统，判断新系统的整体架构能否直接复用（例如要做图书馆检索系统时，本地某个政务文件管理系统可能与其共享"检索与索引/用户与权限/文档与存储/管理后台"等能力，可直接以它为骨架）。
 
+> **定位：候选发现器，不是自动决策器。** 所有匹配度与架构相似度均为关键词/文件名/能力标签重叠的启发式信号，用于生成候选清单供**用户**选择；数据模型、边界与非功能需求兼容性必须由人工确认。
+
 ## 核心工作流
 
 ```
-用户提出开发需求
+用户提出开发需求（新组件 / 新项目 / 大型重构）
   → 澄清需求（范围/语言/约束）
   → reuse_survey：自动调查（本地代码库 + 本地系统架构画像 + GitHub 等开源平台）并评估价值权衡
   → 向用户呈现候选清单 + 价值对比，询问是否复用
@@ -15,6 +17,7 @@ DeepSeek Harness (DSH) 代码参考检索与工程规范插件：在**厘清需�
   → 按用户选择执行（复用 → 改造 → 引入依赖 → 从零实现）
 ```
 
+- **小任务豁免**：改单个按钮、修复空指针/拼写缺陷、变量重命名等小型改动（预估 <50 行且不引入新组件/新项目）**不触发**调查与询问，直接修改，避免打断流程
 - **默认询问**：`reuse_survey` 调查后弹出选项（系统骨架 / 本地候选 / 开源候选 / 不复用直接开发），用户决定
 - **可选不询问**：公司政策文件配置 `"reuseMode": "auto"`（或工具传 `ask=false`），跳过询问直接采用评估推荐（优先复用）
 - **不做强制拦截**：系统不会阻止写文件，复用与否由用户与模型协商决定
@@ -38,7 +41,7 @@ DeepSeek Harness (DSH) 代码参考检索与工程规范插件：在**厘清需�
 
 - **15 类业务能力词典**（中英文关键词）：检索与索引 / 元数据与分类 / 用户与权限 / 审批与流程 / 导入导出与批处理 / 报表与统计 / 审计与日志 / 文档与存储 / 资源与借还 / 订单与交易 / 通知与消息 / API 与服务化 / 任务与待办 / 组织与机构 / 管理后台
 - **系统画像**：扫描 `root` 下每个顶层业务目录，生成能力矩阵、文件数、行数、语言
-- **相似度** = 需求能力标签与系统能力标签的重叠比例；`reuse_survey` 将相似度 ≥50 的系统列为骨架候选（可关闭：`remoteSearch` 不影响本地扫描，直接用 `architecture_reuse_search` 单独调用）
+- **相似度** = 需求能力标签与系统能力标签的重叠比例，**仅为候选信号**；`reuse_survey` 将相似度 ≥60 的系统列为骨架候选，是否采纳需人工确认
 - 选定骨架后建议用 `code_architecture_review` 检查该系统依赖结构是否健康
 
 ## 复用价值判断标准
@@ -59,23 +62,65 @@ DeepSeek Harness (DSH) 代码参考检索与工程规范插件：在**厘清需�
   "blockedLanguages": [],
   "requireTests": false,
   "minCommentRatio": 0,
-  "reuseMode": "ask"
+  "reuseMode": "ask",
+  "remoteSearch": true
 }
 ```
 
-- `reuseMode: "ask"`（默认）：调查后询问用户
-- `reuseMode: "auto"`：不询问，直接采用评估推荐决策（优先复用）
+- `reuseMode: "ask"`（默认）：调查后询问用户；`"auto"`：不询问，直接采用评估推荐决策（优先复用）
+- `remoteSearch: true`（默认）：`reuse_survey` 同时检索 GitHub/npm（会把需求关键词发往对应平台）；企业设 `false` 则只做本地调查
 - 政策检查进入评估：许可证不在白名单 → 排除依赖；语言在黑名单 → 候选不可用；要求测试但候选无测试 → 复用降级为"改造 + 补测试"
 
-## 架构（拆分为三个小插件，通过 codeRef 服务协作）
+### 企业环境建议配置
 
-| 插件 | 职责 | 文件 |
-|---|---|---|
-| `code-ref-core` | 共享服务（HTTP 请求、本地扫描、系统画像与架构相似度、候选评估、政策、决策引擎） | `plugins/core.mjs` |
-| `code-ref-tools` | 7 个检索/架构工具 + 架构自检 | `plugins/tools.mjs` |
-| `code-ref-decision` | 复用价值评估 + 复用调查询问（含系统骨架候选）+ 工程规范提示词 | `plugins/decision.mjs` |
+```json
+{
+  "allowedLicenses": ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause"],
+  "blockedLanguages": [],
+  "requireTests": true,
+  "minCommentRatio": 0,
+  "reuseMode": "ask",
+  "remoteSearch": false
+}
+```
+
+配套实践：不要用 `reuseMode: "auto"`；把扫描根目录严格限定在当前仓库；只把它当"候选发现器"，不信任绝对评分。
+
+## GitHub API 限流与 Token
+
+未认证的 GitHub 搜索 API 约 10 次/分钟。设置环境变量可显著提高配额（5000 次/小时）：
+
+```bash
+export DSH_GITHUB_TOKEN=ghp_xxxxxxxx        # 或 GITHUB_TOKEN
+```
+
+插件会自动在 `api.github.com` 请求上附加 `Authorization: Bearer`，**不会**附加给 npm 等其他域名。Token 请勿写入政策文件或提交进 git（参见 [SECURITY.md](./SECURITY.md) 威胁模型）。
+
+## 测试与 CI
+
+- 单元测试：`node --test test/core.test.mjs`（54 个用例，node:test 零依赖）——纯函数、扫描边界（SKIP_DIRS/大小/fileBudget/扩展名）、远程 API mock（Token 携带与隔离、多档重试、端到端评估）
+- CI：GitHub Actions（Node 20/22）自动运行语法检查 + 单测 + 政策 JSON 校验
 
 ## 安装
+
+### 固定版本（推荐）
+
+永远不要跟随 `main` 分支。固定到具体 tag 或 commit：
+
+```bash
+# 方式 A：tag（如 v4.1.0）
+git clone --branch v4.1.0 --depth 1 https://github.com/victorzhong0110/dsh-code-reference.git
+
+# 方式 B：固定 commit
+git clone https://github.com/victorzhong0110/dsh-code-reference.git
+cd dsh-code-reference && git checkout <commit-sha>
+```
+
+可选：校验文件完整性（在发布页获取对应 sha256）：
+
+```bash
+shasum -a 256 plugins/core.mjs plugins/tools.mjs plugins/decision.mjs
+```
 
 ### 部署级（推荐：所有会话 + 重启后持久生效）
 
@@ -98,9 +143,17 @@ DeepSeek Harness (DSH) 代码参考检索与工程规范插件：在**厘清需�
 
 在会话中用 `cordis_define` / `cordis_run` 加载本插件的 host 代码（适用于调试；部署后请勿同时运行，避免工具重名）。
 
+## 架构（拆分为三个小插件，通过 codeRef 服务协作）
+
+| 插件 | 职责 | 文件 |
+|---|---|---|
+| `code-ref-core` | 共享服务（HTTP 请求、本地扫描、系统画像与架构相似度、候选评估、政策、决策引擎；v4.1 起为依赖注入工厂 + 顶层纯函数，可单测） | `plugins/core.mjs` |
+| `code-ref-tools` | 7 个检索/架构工具 + 架构自检 | `plugins/tools.mjs` |
+| `code-ref-decision` | 复用价值评估 + 复用调查询问（含系统骨架候选）+ 工程规范提示词 | `plugins/decision.mjs` |
+
 ## 注意事项
 
-- 未认证 API 限流：GitHub 搜索约 10 次/分钟，工具会返回 `resetAt` 重试时间；可配置 Token 提配额
+- **隐私**：远程搜索会把需求关键词发往 GitHub/npm；本地扫描受 `root` 限制并跳过 `node_modules/.git/dist/vendor/tests/site-packages` 等目录，**不上传任何本地代码**（详见 [SECURITY.md](./SECURITY.md)）
 - 远程检索结果为第三方开源项目，复用必须遵守其许可证（`license` 字段）
 - 询问等待上限 90 秒（无真人应答的上下文会自动跳过询问并采用推荐决策）
 - `reuse_survey` 返回 `answer.status="unanswered"`（未回答/超时）时，模型**不得**开始写代码，须先报告调查结果等待用户决定

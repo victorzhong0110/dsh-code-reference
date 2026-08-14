@@ -71,7 +71,11 @@ export default {
         + '若政策文件配置 reuseMode="auto"（或传 ask=false）则不询问，直接采用评估给出的推荐决策（优先复用）。'
         + '若无任何候选则不弹窗（mode=no-candidates，推荐 rewrite）。'
         + '注意：若返回 answer.status="unanswered"（用户未回答/询问超时），不得开始写代码，应先把调查结果报告给用户并等待其决定。'
-        + '适合在澄清需求之后、开始写代码之前调用一次。',
+        + '适合在澄清需求之后、开始写代码之前调用一次。'
+        + '小任务无需调用本工具：仅修改单个按钮、修复空指针/拼写等缺陷、变量重命名等小型改动（预估改动 <50 行且不引入新组件/新项目）'
+        + '直接修改即可，不要触发调查与询问，避免打断流程。'
+        + '隐私提示：远程搜索（GitHub/npm）会把需求中提取的关键词发送到对应平台；企业环境可在政策文件设 remoteSearch=false（或传 remoteSearch=false）只做本地调查。'
+        + '本地扫描范围受 root 限制并自动跳过 node_modules/.git/dist/vendor 等目录，不会上传任何本地代码。',
       parameters: {
         type: 'object',
         properties: {
@@ -98,15 +102,20 @@ export default {
         if (local.error) return { ok: false, message: local.error }
         const localPaths = local.candidates.slice(0, 5).map((c) => c.path)
 
+        // 远程搜索默认值：显式参数 > 政策文件 remoteSearch（默认 true，企业可设 false 仅本地调查）
+        const prePolicy = await ref.loadPolicy(undefined, localPaths, exec.signal)
+        const remoteSearchDefault = prePolicy && prePolicy.data ? prePolicy.data.remoteSearch !== false : true
+        const doRemoteSearch = args.remoteSearch === undefined ? remoteSearchDefault : args.remoteSearch === true
+
         let remoteSpecs = []
-        if (args.remoteSearch !== false) {
+        if (doRemoteSearch) {
           remoteSpecs = await ref.githubSearchCandidates(words, exec.signal)
         }
 
         const result = await ref.assessCandidates(requirement, localPaths, remoteSpecs, cfg, exec.signal)
         if (result.error) return { ok: false, message: result.error }
 
-        // 架构级复用：扫描本地系统画像，找出可作为整体骨架的系统候选
+        // 架构级复用：扫描本地系统画像，找出可作为整体骨架的系统候选（候选发现器，阈值 60 较保守）
         const systemCandidates = []
         let rootPath = String(args.root || '').trim()
         if (!rootPath) rootPath = ctx.sandboxPolicy.workspaceRoot || ''
@@ -117,7 +126,7 @@ export default {
             if (!profile.error && profile.systems.length > 0) {
               for (const s of profile.systems) {
                 const sim = ref.architectureSimilarity(reqLabels, s.capabilities)
-                if (sim.similarity >= 50) {
+                if (sim.similarity >= 60) {
                   systemCandidates.push(Object.assign({}, s, { similarity: sim.similarity, overlap: sim.overlap, missing: sim.missing }))
                 }
               }
@@ -134,9 +143,9 @@ export default {
         const lines = []
         lines.push('需求：' + requirement)
         if (hasSystemCandidates) {
-          lines.push('本地系统骨架候选（架构级复用，相似度 >=50）：')
+          lines.push('本地系统骨架候选（架构级复用，相似度 >=60，候选发现器定位）：')
           for (const s of systemCandidates) {
-            lines.push('  - ' + s.name + '：架构相似度 ' + s.similarity + '/100，能力 ' + s.capabilities.join('、') + '，' + s.files + ' 文件 / ' + s.lines + ' 行 / ' + s.languages.join(', '))
+            lines.push('  - ' + s.name + '：架构相似度 ' + s.similarity + '/100（能力标签重叠比例，需人工确认数据模型/边界兼容后决定），能力 ' + s.capabilities.join('、') + '，' + s.files + ' 文件 / ' + s.lines + ' 行 / ' + s.languages.join(', '))
           }
         }
         if (result.locals.length > 0) {
@@ -156,7 +165,7 @@ export default {
             lines.push('开源候选：' + (r.fullName || r.name) + '（匹配 ' + r.matchScore + '/100，' + (r.active ? '维护活跃' : '维护沉寂') + '，许可证 ' + (r.license || '未知') + '，' + (r.stars || 0) + ' stars' + (r.blocked ? '，被公司政策排除' : '') + '）')
             if (r.description) lines.push('          描述：' + String(r.description).slice(0, 80))
           }
-        } else if (args.remoteSearch !== false) {
+        } else if (doRemoteSearch) {
           lines.push('开源平台未找到匹配候选（可尝试更具体的关键词，或用 github_reference_search 单独检索）。')
         }
         if (result.policy && result.policy.note) lines.push('政策：' + result.policy.note)
@@ -293,6 +302,18 @@ export default {
         + 'evaluates the reuse-vs-rewrite value tradeoff (reuse_value_assessment logic), and then ASKS the user '
         + 'which candidate to reuse (or whether to skip reuse and build from scratch) with the tradeoffs shown. '
         + 'Follow the user\'s choice.\n'
+        + 'MINOR TASKS EXEMPTION: do NOT run reuse_survey for small changes — tweaking a single button, fixing a '
+        + 'null pointer/typo bug, renaming a variable, or any edit estimated under 50 lines that introduces no '
+        + 'new component or new project. Just make the edit directly; the survey flow is for new components, new '
+        + 'projects, and substantial refactors where reuse actually pays off.\n'
+        + 'CANDIDATE DISCOVERY, NOT VERDICT: all match scores and architecture similarities are heuristic signals '
+        + 'computed from keywords/file names/capability-label overlap. They generate a candidate shortlist for '
+        + 'the user to choose from; they never replace human judgment about data models, boundaries, or '
+        + 'non-functional compatibility. Always present candidates with tradeoffs and let the user decide.\n'
+        + 'PRIVACY: remote search (GitHub/npm) sends requirement-derived keywords to those platforms; if the '
+        + 'policy file sets remoteSearch=false (or the user passes remoteSearch=false), run the local survey '
+        + 'only. Local scans are bounded by the root parameter and skip node_modules/.git/dist/vendor/tests; '
+        + 'no local source code is ever uploaded.\n'
         + 'Architecture-level reuse: besides finding similar implementations, also check whether an existing '
         + 'local system\'s overall architecture can be reused as the skeleton for the new system. For example, a '
         + 'library retrieval system may share capabilities (search & indexing, user & permissions, document & '
