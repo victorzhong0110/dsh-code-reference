@@ -39,7 +39,7 @@
 
 ## 报告漏洞
 
-请勿公开披露。通过 GitHub Issues（`Security` 标签）或直接联系维护者，描述：
+请勿公开披露。通过 GitHub Issues（`Security` 标签）或邮件 **victorzhong0110@gmail.com** 联系维护者，描述：
 
 1. 影响面（数据外发/注入/DoS）
 2. 复现步骤
