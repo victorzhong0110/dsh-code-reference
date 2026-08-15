@@ -1,7 +1,7 @@
 // dsh-code-reference 复用决策工具 + 提示词（与动态版 crfdc-4/pkg-26 一致）
 export default {
   name: 'code-ref-decision',
-  inject: ['codeRef', 'timer', 'systemPrompt', 'userQuestions'],
+  inject: ['codeRef', 'timer', 'systemPrompt', 'userQuestions', 'tools', 'sandboxPolicy'],
   apply(ctx) {
     const ref = ctx.codeRef
     const renderJson = (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
@@ -35,7 +35,7 @@ export default {
         },
         required: ['requirement'],
       },
-      output: { schema: { type: 'json' }, render: renderJson },
+      output: { schema: { type: 'object' }, render: renderJson },
       timeoutMs: 60000,
       presentCall: (args) => ({ card: 'generic', kind: 'read', title: '复用价值评估: ' + String((args && args.requirement) || '') }),
       async execute(args, exec) {
@@ -90,7 +90,7 @@ export default {
         },
         required: ['requirement'],
       },
-      output: { schema: { type: 'json' }, render: renderJson },
+      output: { schema: { type: 'object' }, render: renderJson },
       timeoutMs: 150000,
       presentCall: (args) => ({ card: 'generic', kind: 'read', title: '复用调查: ' + String((args && args.requirement) || '') }),
       async execute(args, exec) {

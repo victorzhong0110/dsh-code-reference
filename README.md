@@ -112,7 +112,7 @@ export DSH_GITHUB_TOKEN=ghp_xxxxxxxx        # 或 GITHUB_TOKEN
 本仓库声明了 `dsh.bundle` manifest，可用 DSH 官方插件机制安装（任何目录下）：
 
 ```sh
-git clone --branch v4.2.0 --depth 1 https://github.com/victorzhong0110/dsh-code-reference.git
+git clone --branch v4.2.1 --depth 1 https://github.com/victorzhong0110/dsh-code-reference.git
 dsh plugin --profile web add ./dsh-code-reference
 ```
 
@@ -123,8 +123,8 @@ dsh plugin --profile web add ./dsh-code-reference
 永远不要跟随 `main` 分支。固定到正式 Release 的 tag（带附件 `plugins/*.mjs` + `SHA256SUMS`）：
 
 ```bash
-# 方式 A：tag（如 v4.2.0）
-git clone --branch v4.2.0 --depth 1 https://github.com/victorzhong0110/dsh-code-reference.git
+# 方式 A：tag（如 v4.2.1）
+git clone --branch v4.2.1 --depth 1 https://github.com/victorzhong0110/dsh-code-reference.git
 
 # 方式 B：固定 commit
 git clone https://github.com/victorzhong0110/dsh-code-reference.git

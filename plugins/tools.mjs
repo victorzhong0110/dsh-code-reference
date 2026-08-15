@@ -1,7 +1,7 @@
 // dsh-code-reference 检索与架构工具（与动态版 crfts-3/pkg-25 一致）
 export default {
   name: 'code-ref-tools',
-  inject: ['codeRef', 'subprocess', 'web', 'fs', 'sandboxPolicy'],
+  inject: ['codeRef', 'subprocess', 'web', 'fs', 'sandboxPolicy', 'tools'],
   apply(ctx) {
     const ref = ctx.codeRef
     const renderJson = (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
@@ -24,7 +24,7 @@ export default {
         },
         required: ['query'],
       },
-      output: { schema: { type: 'json' }, render: renderJson },
+      output: { schema: { type: 'object' }, render: renderJson },
       timeoutMs: 60000,
       presentCall: (args) => ({ card: 'generic', kind: 'read', title: 'GitHub 参考检索: ' + String((args && args.query) || '') }),
       async execute(args, exec) {
@@ -93,7 +93,7 @@ export default {
         },
         required: ['owner', 'repo'],
       },
-      output: { schema: { type: 'json' }, render: renderJson },
+      output: { schema: { type: 'object' }, render: renderJson },
       timeoutMs: 45000,
       presentCall: (args) => ({ card: 'generic', kind: 'read', title: 'GitHub 仓库参考: ' + String((args && args.owner) || '') + '/' + String((args && args.repo) || '') }),
       async execute(args, exec) {
@@ -165,7 +165,7 @@ export default {
         },
         required: ['query'],
       },
-      output: { schema: { type: 'json' }, render: renderJson },
+      output: { schema: { type: 'object' }, render: renderJson },
       timeoutMs: 40000,
       presentCall: (args) => ({ card: 'generic', kind: 'read', title: 'GitLab 参考检索: ' + String((args && args.query) || '') }),
       async execute(args, exec) {
@@ -211,7 +211,7 @@ export default {
         },
         required: ['query'],
       },
-      output: { schema: { type: 'json' }, render: renderJson },
+      output: { schema: { type: 'object' }, render: renderJson },
       timeoutMs: 40000,
       presentCall: (args) => ({ card: 'generic', kind: 'read', title: 'Gitee 参考检索: ' + String((args && args.query) || '') }),
       async execute(args, exec) {
@@ -269,7 +269,7 @@ export default {
         },
         required: ['query'],
       },
-      output: { schema: { type: 'json' }, render: renderJson },
+      output: { schema: { type: 'object' }, render: renderJson },
       timeoutMs: 40000,
       presentCall: (args) => ({ card: 'generic', kind: 'read', title: 'npm 参考检索: ' + String((args && args.query) || '') }),
       async execute(args, exec) {
@@ -324,7 +324,7 @@ export default {
         },
         required: ['query'],
       },
-      output: { schema: { type: 'json' }, render: renderJson },
+      output: { schema: { type: 'object' }, render: renderJson },
       timeoutMs: 90000,
       presentCall: (args) => ({ card: 'generic', kind: 'read', title: '本地复用检索: ' + String((args && args.query) || '') }),
       async execute(args, exec) {
@@ -363,7 +363,7 @@ export default {
           maxCycles: { type: 'integer', default: 5, description: '最多报告多少个循环依赖，1-20，默认 5' },
         },
       },
-      output: { schema: { type: 'json' }, render: renderJson },
+      output: { schema: { type: 'object' }, render: renderJson },
       timeoutMs: 120000,
       presentCall: () => ({ card: 'generic', kind: 'read', title: '架构自检（高内聚低耦合）' }),
       async execute(args, exec) {
@@ -509,7 +509,7 @@ export default {
         },
         required: ['requirement'],
       },
-      output: { schema: { type: 'json' }, render: renderJson },
+      output: { schema: { type: 'object' }, render: renderJson },
       timeoutMs: 120000,
       presentCall: (args) => ({ card: 'generic', kind: 'read', title: '架构级复用检索: ' + String((args && args.requirement) || '') }),
       async execute(args, exec) {

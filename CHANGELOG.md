@@ -2,6 +2,21 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本（[SemVer](https://semver.org/lang/zh-CN/)）。
 
+## [v4.2.1] - 2026-08-15
+
+> 修复 bundle 安装链路（榜单评审：v4.2.0 的 tag 不含 `dsh.bundle` manifest，克隆该 tag 无法一键安装）。
+
+### 修复
+- **部署版 boot 失败**（真实 `dsh` CLI 冒烟发现）：`tools.mjs` / `decision.mjs` 使用 `ctx.tools` 但 `inject` 未声明（缺 `tools`，`decision` 另缺 `sandboxPolicy`）→ 已补全
+- **部署版工具注册 schema 不兼容**：`output.schema.type: 'json'` 是动态版 DSL 约定，部署 loader 要求标准 JSON Schema 类型 → 全部改为 `'object'`
+
+### 新增
+- **bundle 校验脚本** `scripts/check-bundle.mjs`（CI 执行）：`dsh.bundle.patch` 存在性、patch 行包名子路径引用与文件存在性、exports 通配允许、**inject 完整性**（apply 内 `ctx.<svc>` 引用必须声明在 inject，防部署 boot 失败）
+- `SHA256SUMS` 扩展覆盖 `package.json` / `cordis.patch.yml`（共 5 个安装必需文件）
+
+### 验证
+- 干净 DSH 环境完整冒烟：`dsh plugin add` → `--dump-config` 层注入 → boot 加载（0 错误，web 探活响应）→ `dsh plugin remove` → 清理
+
 ## [v4.2.0] - 2026-08-15
 
 > 第二轮评审（实现 7.5、生产可用性 6.5）迭代：程序化小任务豁免、隐私表述精确化、企业安全默认、发布闭环。

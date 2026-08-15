@@ -1,6 +1,6 @@
 {
   "name": "dsh-code-reference",
-  "version": "4.2.0",
+  "version": "4.2.1",
   "description": "Code reference & reuse-survey plugin for DeepSeek Harness (DSH): search local code + GitHub/npm before building, evaluate reuse vs rewrite, ask the user, architecture-level reuse. 开发前检索本地与开源可复用代码并询问用户的复用调查插件。",
   "type": "module",
   "main": "plugins/core.mjs",

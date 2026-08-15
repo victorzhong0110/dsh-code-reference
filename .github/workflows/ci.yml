@@ -29,3 +29,7 @@ jobs:
         run: node --test test/core.test.mjs test/decision.test.mjs
       - name: 政策文件 JSON 合法性
         run: node -e "for (const f of ['.code-reference-policy.json','.code-reference-policy.enterprise.json']) { JSON.parse(require('fs').readFileSync(f,'utf8')); console.log(f, 'OK') }"
+      - name: bundle manifest 校验（dsh.bundle → patch → 插件文件）
+        run: node scripts/check-bundle.mjs
+      - name: SHA256SUMS 与 Release 附件一致性
+        run: shasum -a 256 -c SHA256SUMS
