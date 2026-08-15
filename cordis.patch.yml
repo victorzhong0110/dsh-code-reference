@@ -1,0 +1,10 @@
+# dsh-code-reference bundle 安装层（dsh plugin add 使用）
+# 插件行通过包名 + 子路径引用，Node 解析定位到已安装的代码。
+# 手动安装（--patch）请使用 plugins/ 下三个文件的绝对路径。
+- insert:
+    - id: code-ref-core
+      name: dsh-code-reference/plugins/core.mjs
+    - id: code-ref-tools
+      name: dsh-code-reference/plugins/tools.mjs
+    - id: code-ref-decision
+      name: dsh-code-reference/plugins/decision.mjs

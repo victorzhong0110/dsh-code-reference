@@ -107,6 +107,17 @@ export DSH_GITHUB_TOKEN=ghp_xxxxxxxx        # 或 GITHUB_TOKEN
 
 ## 安装
 
+### 一键安装（`dsh plugin add`，推荐新用户）
+
+本仓库声明了 `dsh.bundle` manifest，可用 DSH 官方插件机制安装（任何目录下）：
+
+```sh
+git clone --branch v4.2.0 --depth 1 https://github.com/victorzhong0110/dsh-code-reference.git
+dsh plugin --profile web add ./dsh-code-reference
+```
+
+卸载：`dsh plugin --profile web remove dsh-code-reference`。也可通过 [dsh-market](https://github.com/dsh-market/dsh-market#readme) 插件市场一键安装。
+
 ### 固定版本（推荐）
 
 永远不要跟随 `main` 分支。固定到正式 Release 的 tag（带附件 `plugins/*.mjs` + `SHA256SUMS`）：
