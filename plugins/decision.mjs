@@ -72,15 +72,16 @@ export default {
         + '若无任何候选则不弹窗（mode=no-candidates，推荐 rewrite）。'
         + '注意：若返回 answer.status="unanswered"（用户未回答/询问超时），不得开始写代码，应先把调查结果报告给用户并等待其决定。'
         + '适合在澄清需求之后、开始写代码之前调用一次。'
-        + '小任务无需调用本工具：仅修改单个按钮、修复空指针/拼写等缺陷、变量重命名等小型改动（预估改动 <50 行且不引入新组件/新项目）'
-        + '直接修改即可，不要触发调查与询问，避免打断流程。'
+        + '小任务豁免：改单个按钮、修复空指针/拼写缺陷、变量重命名等小型改动（预估 <50 行且不引入新组件/新项目）是"模型工作流豁免"——'
+        + '由模型直接修改、不调用本工具；如需程序化强制跳过调查，可传 scope="skip"（返回 mode="minor-skip"，不调查不询问）。'
         + '隐私提示：远程搜索（GitHub/npm）会把需求中提取的关键词发送到对应平台；企业环境可在政策文件设 remoteSearch=false（或传 remoteSearch=false）只做本地调查。'
-        + '本地扫描范围受 root 限制并自动跳过 node_modules/.git/dist/vendor 等目录，不会上传任何本地代码。',
+        + '本地源文件不会发送给 GitHub/npm 等检索平台；命中路径、最长 160 字符的代码片段及系统画像会进入当前 Agent/模型上下文。',
       parameters: {
         type: 'object',
         properties: {
           requirement: { type: 'string', description: '目标需求/功能描述（建议含英文术语关键词），调查与评估的基准' },
           root: { type: 'string', description: '本地检索根目录（绝对路径），其下每个顶层业务目录视为一个系统；省略时使用当前工作区根目录' },
+          scope: { type: 'string', enum: ['auto', 'skip'], default: 'auto', description: '任务范围：skip = 小任务程序化豁免（不调查不询问，返回 mode="minor-skip"）；默认 auto 正常调查' },
           remoteSearch: { type: 'boolean', default: true, description: '是否同时调查开源平台（GitHub/npm 等），默认 true' },
           ask: { type: 'boolean', description: '是否询问用户；省略时读政策 reuseMode（默认询问）；false 时不询问直接返回推荐决策' },
           reuseThreshold: { type: 'integer', description: '直接复用匹配度阈值，默认 70' },
@@ -95,6 +96,25 @@ export default {
       async execute(args, exec) {
         const requirement = ref.safeQuery(args.requirement)
         if (requirement === '') throw new Error('requirement 不能为空')
+
+        // 程序化小任务豁免：scope="skip" 直接跳过调查与询问（不读文件、不访问网络、不弹窗）
+        if (String(args.scope || '') === 'skip') {
+          return {
+            ok: true,
+            provider: 'reuse-survey',
+            requirement,
+            mode: 'minor-skip',
+            note: '小任务豁免已触发（scope=skip）：跳过调查与询问，可直接开始开发。',
+            survey: '小任务豁免：未进行调查（scope=skip）。按小改动直接处理，如需复用评估请去掉 scope 参数重跑。',
+            systemCandidates: [],
+            localCandidates: [],
+            remoteCandidates: [],
+            policyChecks: [],
+            decision: { choice: 'rewrite', confidence: 'high', reason: '小任务豁免（scope=skip），未评估候选；直接开发。' },
+            answer: { status: 'skipped', reason: 'minor-scope' },
+          }
+        }
+
         const cfg = ref.defaultConfig(args)
         const words = ref.assessWords(requirement)
 
@@ -302,18 +322,21 @@ export default {
         + 'evaluates the reuse-vs-rewrite value tradeoff (reuse_value_assessment logic), and then ASKS the user '
         + 'which candidate to reuse (or whether to skip reuse and build from scratch) with the tradeoffs shown. '
         + 'Follow the user\'s choice.\n'
-        + 'MINOR TASKS EXEMPTION: do NOT run reuse_survey for small changes — tweaking a single button, fixing a '
-        + 'null pointer/typo bug, renaming a variable, or any edit estimated under 50 lines that introduces no '
-        + 'new component or new project. Just make the edit directly; the survey flow is for new components, new '
-        + 'projects, and substantial refactors where reuse actually pays off.\n'
+        + 'MINOR TASKS EXEMPTION (workflow-level, not plugin-enforced): do NOT run reuse_survey for small '
+        + 'changes — tweaking a single button, fixing a null pointer/typo bug, renaming a variable, or any '
+        + 'edit estimated under 50 lines that introduces no new component or new project. Just make the edit '
+        + 'directly; the survey flow is for new components, new projects, and substantial refactors where '
+        + 'reuse actually pays off. If you need a programmatic skip, call reuse_survey with scope="skip" '
+        + '(returns mode="minor-skip", no survey, no prompt).\n'
         + 'CANDIDATE DISCOVERY, NOT VERDICT: all match scores and architecture similarities are heuristic signals '
         + 'computed from keywords/file names/capability-label overlap. They generate a candidate shortlist for '
         + 'the user to choose from; they never replace human judgment about data models, boundaries, or '
         + 'non-functional compatibility. Always present candidates with tradeoffs and let the user decide.\n'
         + 'PRIVACY: remote search (GitHub/npm) sends requirement-derived keywords to those platforms; if the '
         + 'policy file sets remoteSearch=false (or the user passes remoteSearch=false), run the local survey '
-        + 'only. Local scans are bounded by the root parameter and skip node_modules/.git/dist/vendor/tests; '
-        + 'no local source code is ever uploaded.\n'
+        + 'only. Local source files are never sent to GitHub/npm or any retrieval platform; matched paths, '
+        + 'up-to-160-char code snippets, and system profiles do enter the current agent/model context. Local '
+        + 'scans are bounded by the root parameter and skip node_modules/.git/dist/vendor/tests/site-packages.\n'
         + 'Architecture-level reuse: besides finding similar implementations, also check whether an existing '
         + 'local system\'s overall architecture can be reused as the skeleton for the new system. For example, a '
         + 'library retrieval system may share capabilities (search & indexing, user & permissions, document & '

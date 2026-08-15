@@ -9,7 +9,7 @@
 | 面 | 说明 | 缓解 |
 |---|---|---|
 | 需求关键词外发 | 开启远程搜索时，`reuse_survey` 会把从需求中提取的关键词（`assessWords`，最多 8 个 ASCII/中文词）发往 GitHub/npm 检索 API | 政策文件 `"remoteSearch": false` 或工具参数 `remoteSearch=false` 只做本地调查；README 已提示企业默认关闭 |
-| 本地代码进入模型上下文 | 本地扫描会把命中文件的路径、匹配行片段（≤160 字符/行）与系统画像摘要放入工具返回结果 | 扫描范围受 `root` 参数限制；自动跳过 `node_modules/.git/dist/vendor/tests/site-packages` 等；单文件读取上限 256KB；**不会上传任何本地源文件** |
+| 本地代码进入模型上下文 | 本地扫描会把命中文件的路径、匹配行片段（≤160 字符/行）与系统画像摘要放入工具返回结果，随后进入当前 Agent/模型上下文 | 扫描范围受 `root` 参数限制；自动跳过 `node_modules/.git/dist/vendor/tests/site-packages` 等；单文件读取上限 256KB；**本地源文件不会发送给 GitHub/npm 等任何检索平台** |
 | Token 泄漏 | `GITHUB_TOKEN` 环境变量 | `Authorization: Bearer` 仅附加给 `https://api.github.com/` 域名的请求，其他域名（npm 等）不携带；不要把 Token 写入政策文件或提交进 git |
 
 ### 2. 命令注入（Command Injection）
@@ -32,9 +32,10 @@
 
 | 版本 | 支持状态 |
 |---|---|
-| v4.1.x（main） | ✅ 支持 |
-| v4.0.x | ✅ 支持 |
-| v3.x 及更早 | ❌ 不再维护（升级到 v4.1） |
+| v4.2.x（main） | ✅ 支持 |
+| v4.1.x | ✅ 支持 |
+| v4.0.x | ⚠️ 仅安全修复 |
+| v3.x 及更早 | ❌ 不再维护（升级到 v4.2） |
 
 ## 报告漏洞
 

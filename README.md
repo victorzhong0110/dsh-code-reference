@@ -17,7 +17,7 @@ DeepSeek Harness (DSH) 代码参考检索与工程规范插件：在**厘清需�
   → 按用户选择执行（复用 → 改造 → 引入依赖 → 从零实现）
 ```
 
-- **小任务豁免**：改单个按钮、修复空指针/拼写缺陷、变量重命名等小型改动（预估 <50 行且不引入新组件/新项目）**不触发**调查与询问，直接修改，避免打断流程
+- **小任务豁免（模型工作流规则）**：改单个按钮、修复空指针/拼写缺陷、变量重命名等小型改动（预估 <50 行且不引入新组件/新项目）**不触发**调查与询问，直接修改；需要程序化强制跳过时给 `reuse_survey` 传 `scope="skip"`（返回 `mode="minor-skip"`，不调查不询问）
 - **默认询问**：`reuse_survey` 调查后弹出选项（系统骨架 / 本地候选 / 开源候选 / 不复用直接开发），用户决定
 - **可选不询问**：公司政策文件配置 `"reuseMode": "auto"`（或工具传 `ask=false`），跳过询问直接采用评估推荐（优先复用）
 - **不做强制拦截**：系统不会阻止写文件，复用与否由用户与模型协商决定
@@ -73,9 +73,11 @@ DeepSeek Harness (DSH) 代码参考检索与工程规范插件：在**厘清需�
 
 ### 企业环境建议配置
 
+仓库附带企业模板 [`.code-reference-policy.enterprise.json`](./.code-reference-policy.enterprise.json)，复制为 `.code-reference-policy.json` 即可：
+
 ```json
 {
-  "allowedLicenses": ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause"],
+  "allowedLicenses": ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MPL-2.0", "Unlicense", "0BSD"],
   "blockedLanguages": [],
   "requireTests": true,
   "minCommentRatio": 0,
@@ -85,6 +87,8 @@ DeepSeek Harness (DSH) 代码参考检索与工程规范插件：在**厘清需�
 ```
 
 配套实践：不要用 `reuseMode: "auto"`；把扫描根目录严格限定在当前仓库；只把它当"候选发现器"，不信任绝对评分。
+
+> 安全默认说明：仓库自带的 `.code-reference-policy.json` 未设置 `remoteSearch`（代码缺省为 `true`，个人试用即可外发需求关键词）。**企业环境必须使用上方模板**（`remoteSearch: false` + `requireTests: true`）并纳入代码审查。
 
 ## GitHub API 限流与 Token
 
@@ -98,28 +102,28 @@ export DSH_GITHUB_TOKEN=ghp_xxxxxxxx        # 或 GITHUB_TOKEN
 
 ## 测试与 CI
 
-- 单元测试：`node --test test/core.test.mjs`（54 个用例，node:test 零依赖）——纯函数、扫描边界（SKIP_DIRS/大小/fileBudget/扩展名）、远程 API mock（Token 携带与隔离、多档重试、端到端评估）
-- CI：GitHub Actions（Node 20/22）自动运行语法检查 + 单测 + 政策 JSON 校验
+- 单元测试：`node --test test/core.test.mjs test/decision.test.mjs`（67 个用例，node:test 零依赖）——core：纯函数、扫描边界（SKIP_DIRS/大小/fileBudget/扩展名）、远程 API mock（Token 携带与隔离、多档重试、端到端评估）；decision：政策优先级（reuseMode/remoteSearch）、询问超时、`no-candidates`、`auto-fallback`、用户选择映射、`scope="skip"` 程序化豁免、宿主加载冒烟
+- CI：GitHub Actions（Node 20/22，actions 按 commit SHA 固定）自动运行语法检查 + 单测 + 政策 JSON 校验
 
 ## 安装
 
 ### 固定版本（推荐）
 
-永远不要跟随 `main` 分支。固定到具体 tag 或 commit：
+永远不要跟随 `main` 分支。固定到正式 Release 的 tag（带附件 `plugins/*.mjs` + `SHA256SUMS`）：
 
 ```bash
-# 方式 A：tag（如 v4.1.0）
-git clone --branch v4.1.0 --depth 1 https://github.com/victorzhong0110/dsh-code-reference.git
+# 方式 A：tag（如 v4.2.0）
+git clone --branch v4.2.0 --depth 1 https://github.com/victorzhong0110/dsh-code-reference.git
 
 # 方式 B：固定 commit
 git clone https://github.com/victorzhong0110/dsh-code-reference.git
 cd dsh-code-reference && git checkout <commit-sha>
 ```
 
-可选：校验文件完整性（在发布页获取对应 sha256）：
+校验文件完整性（仓库根目录 `SHA256SUMS` 或 Release 附件）：
 
 ```bash
-shasum -a 256 plugins/core.mjs plugins/tools.mjs plugins/decision.mjs
+shasum -a 256 -c SHA256SUMS
 ```
 
 ### 部署级（推荐：所有会话 + 重启后持久生效）
@@ -153,7 +157,7 @@ shasum -a 256 plugins/core.mjs plugins/tools.mjs plugins/decision.mjs
 
 ## 注意事项
 
-- **隐私**：远程搜索会把需求关键词发往 GitHub/npm；本地扫描受 `root` 限制并跳过 `node_modules/.git/dist/vendor/tests/site-packages` 等目录，**不上传任何本地代码**（详见 [SECURITY.md](./SECURITY.md)）
+- **隐私**：远程搜索会把需求关键词发往 GitHub/npm；本地扫描受 `root` 限制并跳过 `node_modules/.git/dist/vendor/tests/site-packages` 等目录。**本地源文件不会发送给任何检索平台**；命中路径、最长 160 字符的代码片段及系统画像会进入当前 Agent/模型上下文（详见 [SECURITY.md](./SECURITY.md) 威胁模型）
 - 远程检索结果为第三方开源项目，复用必须遵守其许可证（`license` 字段）
 - 询问等待上限 90 秒（无真人应答的上下文会自动跳过询问并采用推荐决策）
 - `reuse_survey` 返回 `answer.status="unanswered"`（未回答/超时）时，模型**不得**开始写代码，须先报告调查结果等待用户决定

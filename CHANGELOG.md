@@ -2,6 +2,20 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本（[SemVer](https://semver.org/lang/zh-CN/)）。
 
+## [v4.2.0] - 2026-08-15
+
+> 第二轮评审（实现 7.5、生产可用性 6.5）迭代：程序化小任务豁免、隐私表述精确化、企业安全默认、发布闭环。
+
+### 新增
+- **`reuse_survey` 程序化小任务豁免**：新增 `scope` 参数（`skip` → 返回 `mode="minor-skip"`，不扫描、不访问网络、不弹窗）；小任务豁免定位明确为"模型工作流规则 + 程序化出口"
+- **decision 流程测试**：`test/decision.test.mjs`（13 个用例）覆盖政策优先级（reuseMode/remoteSearch）、询问超时、`no-candidates`、`auto-fallback`、用户选择映射、`scope="skip"`、宿主加载冒烟（测试总数 54 → **67**）
+- **企业政策模板** [`.code-reference-policy.enterprise.json`](./.code-reference-policy.enterprise.json)（`remoteSearch: false` + `requireTests: true`）
+- 仓库根目录 `SHA256SUMS`（三插件文件完整性校验）；正式 GitHub Release（含插件附件 + SHA256SUMS）
+
+### 变更
+- **隐私表述精确化**（README/工具描述/提示词/SECURITY）：本地源文件不会发送给 GitHub/npm 等检索平台；命中路径、最长 160 字符的代码片段及系统画像会进入当前 Agent/模型上下文
+- CI：`actions/checkout`/`setup-node` 固定到 commit SHA（供应链安全）；单测命令纳入 decision 测试与 enterprise 模板 JSON 校验
+
 ## [v4.1.0] - 2026-08-15
 
 > 依据外部评审（产品思路 8/10、实现 6/10、生产可用性 4/10）迭代：聚焦**可测试性、安全、隐私、流程摩擦**。
