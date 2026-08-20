@@ -71,7 +71,28 @@ DeepSeek Harness (DSH) 代码参考检索与工程规范插件：在**厘清需�
 
 - `reuseMode: "ask"`（默认）：调查后询问用户；`"auto"`：不询问，直接采用评估推荐决策（优先复用）
 - `remoteSearch: true`（默认）：`reuse_survey` 同时检索 GitHub/npm（会把需求关键词发往对应平台）；企业设 `false` 则只做本地调查
-- 政策检查进入评估：许可证不在白名单 → 排除依赖；语言在黑名单 → 候选不可用；要求测试但候选无测试 → 复用降级为"改造 + 补测试"
+- 政策检查进入评估：许可证不在白名单 → 排除依赖；**许可证未知 → 默认阻断**（已配置白名单时，未知许可证无法确认合规，必须人工确认后才能放行，绝不显示"已通过"）；语言在黑名单 → 候选不可用；要求测试但候选无测试 → 复用降级为"改造 + 补测试"
+
+### 部署级政策（可信上限）
+
+工作区自带的 `.code-reference-policy.json` 属于仓库内容，**不可信**：任何仓库都能往里面写 `"reuseMode": "auto"` 或 `"remoteSearch": true`。企业强制政策应通过部署级配置注入：
+
+```bash
+export DSH_CODE_REFERENCE_POLICY=/etc/dsh/code-reference-policy.json   # 部署级可信政策（JSON 文件路径）
+```
+
+部署级政策是**不可放宽的上限**，工作区政策只能收紧：
+
+| 字段 | 合并规则 |
+| --- | --- |
+| `allowedLicenses` | 取交集（工作区不能扩大白名单） |
+| `blockedLanguages` | 取并集 |
+| `requireTests` | 任一为 true 即 true |
+| `minCommentRatio` | 取最大值 |
+| `reuseMode` | 任一为 `ask` 即 `ask`（工作区不能改成 auto） |
+| `remoteSearch` | 任一为 `false` 即 `false`（工作区不能打开外发） |
+
+部署级文件缺失或无法读取时，评估结果会给出明确提示（不静默降级）。未配置部署级政策时，行为与旧版一致（工作区政策直接生效）。
 
 ### 企业环境建议配置
 
@@ -88,9 +109,7 @@ DeepSeek Harness (DSH) 代码参考检索与工程规范插件：在**厘清需�
 }
 ```
 
-配套实践：不要用 `reuseMode: "auto"`；把扫描根目录严格限定在当前仓库；只把它当"候选发现器"，不信任绝对评分。
-
-> 安全默认说明：仓库自带的 `.code-reference-policy.json` 未设置 `remoteSearch`（代码缺省为 `true`，个人试用即可外发需求关键词）。**企业环境必须使用上方模板**（`remoteSearch: false` + `requireTests: true`）并纳入代码审查。
+配套实践：不要用 `reuseMode: "auto"`；把扫描根目录严格限定在当前仓库；只把它当"候选发现器"，不信任绝对评分；企业环境请同时配置 `DSH_CODE_REFERENCE_POLICY` 部署级政策，且该文件只允许部署管理员修改。
 
 ## GitHub API 限流与 Token
 

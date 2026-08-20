@@ -16,7 +16,8 @@ export default {
         + '对开源候选量化：描述匹配度、维护活跃度（最近更新距今）、许可证、star。'
         + '阈值可调：reuseThreshold（默认 70）/ adaptThreshold（默认 40）/ remoteThreshold（默认 50）/ smallLines（默认 300）/ mediumLines（默认 800）/ maxComplexityPercent（默认 12）。'
         + '支持公司政策：默认按顺序查找 显式 policyPath → 工作区根 → 本地候选目录向上 3 层的 .code-reference-policy.json，'
-        + '字段：allowedLicenses（许可证白名单）、blockedLanguages（禁止语言）、requireTests（必须带测试）、minCommentRatio（最低注释比 0-1）、reuseMode（ask 询问 / auto 自动优先复用）。'
+        + '部署级政策（环境变量 DSH_CODE_REFERENCE_POLICY 指向的 JSON 文件）始终作为不可放宽的上限（工作区文件只能收紧）。'
+        + '字段：allowedLicenses（许可证白名单，未知许可证默认阻断）、blockedLanguages（禁止语言）、requireTests（必须带测试）、minCommentRatio（最低注释比 0-1）、reuseMode（ask 询问 / auto 自动优先复用）、remoteSearch（是否外发关键词检索）。'
         + '输出决策：reuse（直接复用）/ adapt（改造复用）/ dependency（引入依赖）/ rewrite（自制）。'
         + '提示：requirement 描述建议同时包含英文术语关键词，中文词对英文代码库的匹配信号较弱。',
       parameters: {
@@ -45,7 +46,7 @@ export default {
         if (words.length === 0) return { ok: false, message: 'requirement 中未找到有效关键词（描述过短或全为停用词）' }
         const cfg = ref.defaultConfig(args)
         const localPaths = String(args.localCandidates || '').split(',').map((p) => p.trim()).filter(Boolean).slice(0, 5)
-        const result = await ref.assessCandidates(requirement, localPaths, args.remoteCandidate ? [args.remoteCandidate] : [], cfg, exec.signal)
+        const result = await ref.assessCandidates(requirement, localPaths, args.remoteCandidate ? [args.remoteCandidate] : [], cfg, exec.signal, args.policyPath)
         if (result.error) return { ok: false, message: result.error }
         return {
           ok: true,
@@ -82,8 +83,9 @@ export default {
           requirement: { type: 'string', description: '目标需求/功能描述（建议含英文术语关键词），调查与评估的基准' },
           root: { type: 'string', description: '本地检索根目录（绝对路径），其下每个顶层业务目录视为一个系统；省略时使用当前工作区根目录' },
           scope: { type: 'string', enum: ['auto', 'skip'], default: 'auto', description: '任务范围：skip = 小任务程序化豁免（不调查不询问，返回 mode="minor-skip"）；默认 auto 正常调查' },
-          remoteSearch: { type: 'boolean', default: true, description: '是否同时调查开源平台（GitHub/npm 等），默认 true' },
+          remoteSearch: { type: 'boolean', default: true, description: '是否同时调查开源平台（GitHub/npm 等），默认 true；企业政策可强制 false 只做本地调查（部署级政策优先）' },
           ask: { type: 'boolean', description: '是否询问用户；省略时读政策 reuseMode（默认询问）；false 时不询问直接返回推荐决策' },
+          policyPath: { type: 'string', description: '公司政策文件路径（JSON）；省略时自动查找工作区与候选目录；部署级政策（DSH_CODE_REFERENCE_POLICY）始终优先' },
           reuseThreshold: { type: 'integer', description: '直接复用匹配度阈值，默认 70' },
           adaptThreshold: { type: 'integer', description: '改造复用匹配度阈值，默认 40' },
           remoteThreshold: { type: 'integer', description: '远程候选匹配度阈值，默认 50' },
@@ -123,7 +125,7 @@ export default {
         const localPaths = local.candidates.slice(0, 5).map((c) => c.path)
 
         // 远程搜索默认值：显式参数 > 政策文件 remoteSearch（默认 true，企业可设 false 仅本地调查）
-        const prePolicy = await ref.loadPolicy(undefined, localPaths, exec.signal)
+        const prePolicy = await ref.loadPolicy(args.policyPath, localPaths, exec.signal)
         const remoteSearchDefault = prePolicy && prePolicy.data ? prePolicy.data.remoteSearch !== false : true
         const doRemoteSearch = args.remoteSearch === undefined ? remoteSearchDefault : args.remoteSearch === true
 
@@ -132,7 +134,7 @@ export default {
           remoteSpecs = await ref.githubSearchCandidates(words, exec.signal)
         }
 
-        const result = await ref.assessCandidates(requirement, localPaths, remoteSpecs, cfg, exec.signal)
+        const result = await ref.assessCandidates(requirement, localPaths, remoteSpecs, cfg, exec.signal, args.policyPath)
         if (result.error) return { ok: false, message: result.error }
 
         // 架构级复用：扫描本地系统画像，找出可作为整体骨架的系统候选（候选发现器，阈值 60 较保守）

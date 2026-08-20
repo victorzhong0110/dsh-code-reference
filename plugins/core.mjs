@@ -22,6 +22,67 @@ export const ARCH_EXTS = new Set(['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 
 export const MAX_SCAN_FILES = 4000
 export const MAX_FILE_BYTES = 262144
 
+/**
+ * Parse a comma-separated extension whitelist ("ts,tsx,js" or ".ts,.tsx")
+ * into a lowercase extension Set. Empty/invalid input falls back to the
+ * default CODE_EXTS — never an empty set (that would scan nothing).
+ */
+export function parseFileTypes(fileTypes) {
+  const raw = String(fileTypes || '').trim()
+  if (!raw) return CODE_EXTS
+  const set = new Set()
+  for (const t of raw.split(',')) {
+    const ext = t.trim().toLowerCase().replace(/^\./, '')
+    if (ext) set.add(ext)
+  }
+  return set.size > 0 ? set : CODE_EXTS
+}
+
+/**
+ * Merge a deployment-level policy (authoritative ceiling) with a workspace
+ * policy. The workspace file may only TIGHTEN: every field resolves to the
+ * stricter of the two (license whitelist = intersection, blocked languages =
+ * union, requireTests = OR, minCommentRatio = max, reuseMode = ask wins,
+ * remoteSearch = false wins). An absent deployment policy leaves the
+ * workspace policy in charge.
+ */
+export function mergePolicy(deployment, workspace) {
+  const d = deployment && deployment.data
+  const w = workspace && workspace.data
+  if (!d && !w) return null
+  const sources = []
+  if (d) sources.push('部署级政策 ' + deployment.source)
+  if (w) sources.push('工作区政策 ' + workspace.source)
+  const licenses = []
+  if (d && d.allowedLicenses.length > 0 && w && w.allowedLicenses.length > 0) {
+    const wl = new Set(w.allowedLicenses.map((x) => String(x).toLowerCase()))
+    for (const x of d.allowedLicenses) if (wl.has(String(x).toLowerCase())) licenses.push(x)
+  } else if (d && d.allowedLicenses.length > 0) {
+    licenses.push(...d.allowedLicenses)
+  } else if (w && w.allowedLicenses.length > 0) {
+    licenses.push(...w.allowedLicenses)
+  }
+  const blocked = new Set()
+  if (d) for (const l of d.blockedLanguages) blocked.add(l)
+  if (w) for (const l of w.blockedLanguages) blocked.add(l)
+  return {
+    source: sources.join(' + '),
+    data: {
+      allowedLicenses: licenses,
+      blockedLanguages: Array.from(blocked),
+      requireTests: Boolean((d && d.requireTests) || (w && w.requireTests)),
+      minCommentRatio: Math.max(d ? d.minCommentRatio : 0, w ? w.minCommentRatio : 0),
+      reuseMode: (d && d.reuseMode) === 'ask' || (w && w.reuseMode) === 'ask' ? 'ask' : 'auto',
+      remoteSearch: (d && d.remoteSearch) === false || (w && w.remoteSearch) === false ? false : true,
+    },
+    note: d && w
+      ? '已合并 ' + sources.join(' + ') + '（工作区政策仅可收紧，不可放宽部署级设置）'
+      : d
+        ? '已加载部署级政策文件 ' + deployment.source
+        : '已加载公司政策文件 ' + workspace.source,
+  }
+}
+
 export const STOPWORDS = new Set(['the', 'and', 'with', 'for', 'from', 'this', 'that', 'using', 'use', 'used', 'make', 'create', 'provide', 'based', 'via', 'tool', 'utility', 'module', 'function', 'component', 'support', 'supports', 'like', 'into', 'your', 'our', 'can', 'will', 'does', 'would', 'should', 'need', 'needs', 'want', 'feature', 'features', 'system', 'also', 'all', 'any', 'are', 'was', 'were', 'been', 'has', 'have', 'had', 'its', 'them', 'their', 'there', 'where', 'which', 'when', 'what', 'who', 'how', 'why', 'but', 'not', 'only', 'just', 'more', 'most', 'some', 'such', 'than', 'then', 'other', 'others'])
 
 // ═══ 架构级复用：能力词典（15 类，中英文）═══
@@ -229,12 +290,17 @@ export function buildPolicyChecks(policy, locals, remotes) {
   }
   if (p.allowedLicenses.length > 0 && Array.isArray(remotes)) {
     for (const r of remotes) {
-      if (!r.error && r.license) {
-        const ok = p.allowedLicenses.some((x) => String(x).toLowerCase() === String(r.license).toLowerCase())
-        if (!ok) {
-          r.blocked = true
-          checks.push({ rule: 'license', status: 'fail', detail: '候选许可证 ' + r.license + ' 不在公司允许列表（' + p.allowedLicenses.join(', ') + '）中' })
-        }
+      if (r.error) continue
+      if (!r.license) {
+        // 未知许可证：无法确认是否符合公司白名单 → 默认阻断，绝不显示"已通过"。
+        r.blocked = true
+        checks.push({ rule: 'license', status: 'fail', detail: '候选许可证未知，无法确认其是否在公司允许列表（' + p.allowedLicenses.join(', ') + '）中；默认阻断，需人工确认后放行' })
+        continue
+      }
+      const ok = p.allowedLicenses.some((x) => String(x).toLowerCase() === String(r.license).toLowerCase())
+      if (!ok) {
+        r.blocked = true
+        checks.push({ rule: 'license', status: 'fail', detail: '候选许可证 ' + r.license + ' 不在公司允许列表（' + p.allowedLicenses.join(', ') + '）中' })
       }
     }
   }
@@ -285,10 +351,11 @@ export function decide(localBest, remote, cfg, checks) {
     }
   }
   if (remote && !remote.error && !licenseBlocked && remote.matchScore >= cfg.remoteThreshold && remote.active) {
+    const licenseChecked = checks.some((c) => c.rule === 'license')
     return {
       choice: 'dependency',
       confidence: 'medium',
-      reason: '开源候选维护活跃且描述匹配（' + remote.matchScore + '>= ' + cfg.remoteThreshold + '），引入依赖通常优于自制；许可证 ' + (remote.license || '未知') + ' 已通过公司政策检查。',
+      reason: '开源候选维护活跃且描述匹配（' + remote.matchScore + '>= ' + cfg.remoteThreshold + '），引入依赖通常优于自制；许可证 ' + (remote.license || '未知') + (licenseChecked ? ' 已通过公司政策检查' : '（公司未配置许可证白名单）') + '。',
     }
   }
   const policyNote = licenseBlocked ? '（候选许可证未通过公司政策检查，已排除）' : ''
@@ -514,10 +581,10 @@ export function createCore(deps) {
     return { pending, truncated }
   }
 
-  async function collectLocalCandidates(query, rootPath, signal, budget) {
+  async function collectLocalCandidates(query, rootPath, signal, budget, fileTypes) {
     const words = queryWords(query)
     if (words.length === 0) return { words, candidates: [], scanned: 0, truncated: false }
-    const exts = CODE_EXTS
+    const exts = parseFileTypes(fileTypes)
     let root = String(rootPath || '').trim()
     if (!root) {
       root = sandboxPolicy.workspaceRoot || ''
@@ -654,7 +721,26 @@ export function createCore(deps) {
     return { systems, scanned: systems.length }
   }
 
+  async function loadDeploymentPolicy(signal) {
+    const path = String(env.DSH_CODE_REFERENCE_POLICY || '').trim()
+    if (!path) return null
+    try {
+      const target = await fs.resolve(path, { signal })
+      const info = await fs.stat(target, signal)
+      if (!info) return { source: path, data: null, note: '部署级政策文件不存在（' + path + '），本次不应用部署级政策' }
+      const text = await fs.readText(target, signal)
+      const data = JSON.parse(text)
+      return { source: path, data: normalizePolicy(data), note: '已加载部署级政策文件 ' + path }
+    } catch (error) {
+      return { source: path, data: null, note: '部署级政策文件读取失败（' + String((error && error.message) || error) + '），本次不应用部署级政策；请修复部署配置' }
+    }
+  }
+
   async function loadPolicy(policyPath, localPaths, signal) {
+    // 1) 部署级政策（环境变量 DSH_CODE_REFERENCE_POLICY 指向的 JSON 文件）是
+    //    可信上限：仓库/工作区自带的政策文件永远不能放宽它（见 mergePolicy）。
+    const deployment = await loadDeploymentPolicy(signal)
+    // 2) 显式 policyPath / 工作区根 / 候选目录向上 3 层的工作区政策文件。
     const candidates = []
     const explicit = String(policyPath || '').trim()
     if (explicit) candidates.push(explicit)
@@ -692,13 +778,29 @@ export function createCore(deps) {
       } catch (error) {
         continue
       }
+      let workspace
       try {
         const data = JSON.parse(text)
-        return { source: path, data: normalizePolicy(data), note: '已加载公司政策文件 ' + path }
+        workspace = { source: path, data: normalizePolicy(data), note: '已加载公司政策文件 ' + path }
       } catch (error) {
-        return { source: path, data: null, note: '政策文件不是合法 JSON，使用宽松默认：' + String((error && error.message) || error) }
+        workspace = { source: path, data: null, note: '政策文件不是合法 JSON，使用宽松默认：' + String((error && error.message) || error) }
       }
+      // 3) 合并：工作区政策只能在部署级政策之内收紧。
+      const merged = mergePolicy(deployment, workspace)
+      if (merged) {
+        // 部署级政策配置了但读取失败时，保留失败提示，避免静默降级。
+        if (deployment && deployment.data === null && workspace.data !== null) {
+          merged.note = (deployment.note ? deployment.note + '；' : '') + merged.note
+        }
+        return merged
+      }
+      const fallback = workspace || { source: null, data: null, note: '未找到政策文件，使用宽松默认' }
+      if (deployment && deployment.data === null) {
+        fallback.note = (deployment.note ? deployment.note + '；' : '') + fallback.note
+      }
+      return fallback
     }
+    if (deployment) return deployment
     const tried = Array.from(seen).join('、')
     return { source: tried || null, data: null, note: '未找到政策文件（尝试：' + (tried || '无') + '），使用宽松默认' }
   }
@@ -842,9 +944,9 @@ export function createCore(deps) {
     return []
   }
 
-  async function assessCandidates(requirement, localPaths, remoteSpecs, cfg, signal) {
+  async function assessCandidates(requirement, localPaths, remoteSpecs, cfg, signal, policyPath) {
     const words = assessWords(requirement)
-    const policy = await loadPolicy(undefined, localPaths, signal)
+    const policy = await loadPolicy(policyPath, localPaths, signal)
     const locals = []
     for (const p of localPaths) {
       const a = await analyzeLocalCandidate(p, words, signal)

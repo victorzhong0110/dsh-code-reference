@@ -328,7 +328,7 @@ export default {
       timeoutMs: 90000,
       presentCall: (args) => ({ card: 'generic', kind: 'read', title: '本地复用检索: ' + String((args && args.query) || '') }),
       async execute(args, exec) {
-        const collected = await ref.collectLocalCandidates(args.query, args.root, exec.signal)
+        const collected = await ref.collectLocalCandidates(args.query, args.root, exec.signal, undefined, args.fileTypes)
         if (collected.error) return { ok: false, message: collected.error }
         const maxResults = Math.min(20, Math.max(1, Number(args.maxResults) || 10))
         return {

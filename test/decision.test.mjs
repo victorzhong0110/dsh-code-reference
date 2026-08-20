@@ -181,6 +181,49 @@ describe('ask 询问流程', () => {
 
 // ═══ 政策优先级 ═══
 
+// ═══ reuse_value_assessment：policyPath 透传 ═══
+
+describe('reuse_value_assessment 政策参数', () => {
+  function bootAssessment({ files = {} } = {}) {
+    const fsMock = makeFsMock({ files })
+    const core = createCore({
+      subprocess: makeSubprocessMock(),
+      web: undefined,
+      fs: fsMock,
+      sandboxPolicy: { workspaceRoot: '/ws' },
+      env: {},
+    })
+    const tools = []
+    const ctx = {
+      codeRef: core,
+      tools: { register: (t) => tools.push(t) },
+      timeout: () => ({ dispose: () => {} }),
+      systemPrompt: { section: () => {} },
+      sandboxPolicy: { workspaceRoot: '/ws' },
+    }
+    decisionPlugin.apply(ctx)
+    const assess = tools.find((t) => t.name === 'reuse_value_assessment')
+    assert.ok(assess, '应注册 reuse_value_assessment 工具')
+    const exec = { signal: undefined }
+    return { run: (args) => assess.execute(Object.assign({ requirement: 'search index 检索' }, args), exec) }
+  }
+
+  test('policyPath 参数透传到评估（显式政策生效，而非自动查找）', async () => {
+    const { run } = bootAssessment({
+      files: { '/etc/policy.json': JSON.stringify({ allowedLicenses: ['MIT'], reuseMode: 'auto', remoteSearch: false }) },
+    })
+    const r = await run({ policyPath: '/etc/policy.json', remoteCandidate: 'npm:some-pkg' })
+    assert.equal(r.ok, true)
+    assert.ok(r.policy.source.includes('/etc/policy.json'), '政策应来自显式 policyPath：' + r.policy.source)
+    assert.equal(r.policy.data.remoteSearch, false)
+  })
+
+  test('reuse_survey 也暴露 policyPath 参数', () => {
+    const { survey } = boot()
+    assert.ok(survey.parameters.properties.policyPath, 'reuse_survey 应声明 policyPath 参数')
+  })
+})
+
 describe('政策文件优先级（reuseMode / remoteSearch）', () => {
   const policyFixture = (policyJson) => ({
     dirs: { '/ws': [{ name: 'x.ts', type: 'file', target: '/ws/x.ts', size: 30 }] },
