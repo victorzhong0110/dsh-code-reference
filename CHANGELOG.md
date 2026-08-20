@@ -2,6 +2,25 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本（[SemVer](https://semver.org/lang/zh-CN/)）。
 
+## [v4.3.0] - 2026-08-20
+
+> 第三轮评审（策略执行缺口）迭代：未知许可证阻断、政策信任分层、参数实际生效。
+
+### 修复
+- **未知许可证被白名单放行**（评审复现：`candidateLicense: ""` + `allowedLicenses: ["MIT"]` 显示"已通过公司政策检查"）：配置许可证白名单时，许可证未知的候选**默认阻断**（fail 检查 + `blocked`），绝不显示"已通过"；`decide()` 的依赖推荐理由仅在确实执行过许可证检查时才声称"已通过公司政策检查"
+- **`reuse_value_assessment.policyPath` 实际无效**：`assessCandidates()` 未把该参数传给 `loadPolicy()` → 已透传；`reuse_survey` 同步新增 `policyPath` 参数
+- **`local_code_reuse_search.fileTypes` 实际无效**：执行时始终扫描默认扩展名 → 新增 `parseFileTypes()` 白名单解析并透传（空/无效输入回退默认扩展名）
+
+### 新增
+- **部署级政策信任分层**：环境变量 `DSH_CODE_REFERENCE_POLICY` 指向部署级 JSON 政策文件，作为不可放宽的上限；工作区/仓库自带的 `.code-reference-policy.json` 只能收紧（许可证白名单取交集、禁止语言取并集、`requireTests` OR、`minCommentRatio` 取 max、`reuseMode` ask 优先、`remoteSearch` false 优先）。部署级文件缺失/损坏时明确提示，不静默降级
+
+### 变更
+- CI Node 矩阵 `[20, 22]` → `[22.19.0, 24]`（与 DSH 最低 Node 要求对齐）
+- 测试 67 → **84**（未知许可证、mergePolicy 6 例、parseFileTypes、policyPath 透传、部署级政策加载）
+
+### 验证
+- 84/84 测试通过；`node --check` × 3；bundle manifest 校验；SHA256SUMS 已刷新
+
 ## [v4.2.1] - 2026-08-15
 
 > 修复 bundle 安装链路（榜单评审：v4.2.0 的 tag 不含 `dsh.bundle` manifest，克隆该 tag 无法一键安装）。
