@@ -7,6 +7,18 @@ export default {
     const renderJson = (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
     let pendingAsk = null
 
+      function buildCostEstimate(doRemote, wordsLen) {
+        return {
+          localFileBudget: 1200,
+          localTimeBudgetMs: 15000,
+          systemProfileTimeBudgetMs: 15000,
+          remoteSearch: !!doRemote,
+          remoteKeywordBatches: doRemote ? Math.max(1, Math.min(3, wordsLen || 1)) : 0,
+          note: 'Caps are hard stops for scan/profile; remote calls are best-effort under platform rate limits. Not a dollar invoice.',
+        }
+      }
+
+
     ctx.tools.register({
       name: 'reuse_value_assessment',
       description:
@@ -106,6 +118,7 @@ export default {
             provider: 'reuse-survey',
             requirement,
             mode: 'minor-skip',
+            costEstimate: { localFileBudget: 0, localTimeBudgetMs: 0, systemProfileTimeBudgetMs: 0, remoteSearch: false, remoteKeywordBatches: 0, note: 'scope=skip: no scan/network' },
             note: '小任务豁免已触发（scope=skip）：跳过调查与询问，可直接开始开发。',
             survey: '小任务豁免：未进行调查（scope=skip）。按小改动直接处理，如需复用评估请去掉 scope 参数重跑。',
             systemCandidates: [],
@@ -128,6 +141,7 @@ export default {
         const prePolicy = await ref.loadPolicy(args.policyPath, localPaths, exec.signal)
         const remoteSearchDefault = prePolicy && prePolicy.data ? prePolicy.data.remoteSearch !== false : true
         const doRemoteSearch = args.remoteSearch === undefined ? remoteSearchDefault : args.remoteSearch === true
+        const costEstimate = buildCostEstimate(doRemoteSearch, words.length)
 
         let remoteSpecs = []
         if (doRemoteSearch) {
@@ -202,6 +216,7 @@ export default {
           return {
             ok: true,
             provider: 'reuse-survey',
+            costEstimate,
             requirement,
             mode: 'no-candidates',
             note: '未找到任何可复用候选（含系统骨架），无需询问；推荐按评估决策（通常为自制）直接开发。',
@@ -225,6 +240,7 @@ export default {
               return {
                 ok: true,
                 provider: 'reuse-survey',
+                costEstimate,
                 requirement,
                 mode: 'auto-fallback',
                 note: '用户询问服务不可用（当前上下文无法询问），已按推荐决策返回',
@@ -299,6 +315,7 @@ export default {
         return {
           ok: true,
           provider: 'reuse-survey',
+          costEstimate,
           requirement,
           mode: shouldAsk ? 'ask' : 'auto',
           survey: summary,

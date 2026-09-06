@@ -207,6 +207,19 @@ shasum -a 256 -c SHA256SUMS
 
 ## 成本与预算（面试可讲）
 
+`reuse_survey` 成功返回里带 **`costEstimate`** 字段（面试可指着 JSON 讲）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `localFileBudget` | 本地文件扫描上限（survey 路径默认 1200） |
+| `localTimeBudgetMs` | 本地扫描墙钟上限（默认 15000） |
+| `systemProfileTimeBudgetMs` | 系统画像扫描上限（默认 15000） |
+| `remoteSearch` | 本次是否发远程检索 |
+| `remoteKeywordBatches` | 远程关键词批次数上界（有远程时） |
+
+**最坏情况口述：** 本地扫满 file/time cap +（若开启远程）有限次平台检索；企业模板默认 `remoteSearch: false` 时远程为 0。这是 **cap 叙事**，不是美元账单。
+
+
 代码侧已有扫描上限（可在工具/budget 参数收紧）：
 
 - **fileBudget** — 单次扫描最多触达的文件数
