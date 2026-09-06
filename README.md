@@ -4,7 +4,7 @@
 
 DeepSeek Harness (DSH) 代码参考检索与工程规范插件：在**厘清需求之后**自动调查本地与开源的可复用代码，把"候选清单 + 价值权衡"呈现给用户并**询问是否需要复用**（可选择复用哪个候选/改造/不复用直接开发）；也支持配置为不询问、直接优先复用。
 
-除"内容级"复用（相似的函数/组件/项目）外，还支持**架构级复用**：扫描本地已有的业务系统，判断新系统的整体架构能否直接复用（例如要做图书馆检索系统时，本地某个政务文件管理系统可能与其共享"检索与索引/用户与权限/文档与存储/管理后台"等能力，可直接以它为骨架）。
+除"内容级"复用（相似的函数/组件/项目）外，还支持**架构骨架候选**（常称「架构级复用」）：用能力标签重叠扫描本地业务目录，提出「或许能当骨架」的**候选**。不是自动证明架构等价——是否采纳必须人工确认。
 
 > **定位：候选发现器，不是自动决策器。** 所有匹配度与架构相似度均为关键词/文件名/能力标签重叠的启发式信号，用于生成候选清单供**用户**选择；数据模型、边界与非功能需求兼容性必须由人工确认。
 
@@ -133,7 +133,7 @@ export DSH_GITHUB_TOKEN=ghp_xxxxxxxx        # 或 GITHUB_TOKEN
 本仓库声明了 `dsh.bundle` manifest，可用 DSH 官方插件机制安装（任何目录下）：
 
 ```sh
-git clone --branch v4.2.1 --depth 1 https://github.com/victorzhong0110/dsh-code-reference.git
+git clone --branch v4.3.0 --depth 1 https://github.com/victorzhong0110/dsh-code-reference.git
 dsh plugin --profile web add ./dsh-code-reference
 ```
 
@@ -144,8 +144,8 @@ dsh plugin --profile web add ./dsh-code-reference
 永远不要跟随 `main` 分支。固定到正式 Release 的 tag（带附件 `plugins/*.mjs` + `SHA256SUMS`）：
 
 ```bash
-# 方式 A：tag（如 v4.2.1）
-git clone --branch v4.2.1 --depth 1 https://github.com/victorzhong0110/dsh-code-reference.git
+# 方式 A：tag（如 v4.3.0）
+git clone --branch v4.3.0 --depth 1 https://github.com/victorzhong0110/dsh-code-reference.git
 
 # 方式 B：固定 commit
 git clone https://github.com/victorzhong0110/dsh-code-reference.git
@@ -196,10 +196,22 @@ shasum -a 256 -c SHA256SUMS
 
 ## 反馈与贡献
 
-当前状态：**可靠的 beta / 可用于企业内部试点**。距离稳定 GA 主要差真实 DSH 环境端到端测试、长期兼容性验证和更多实际项目反馈。
+当前状态：**beta（可用于内部试点）**。距离稳定 GA 主要差真实 DSH 环境长期端到端验证与更多实际项目反馈；不要把社区 Awesome 徽章理解成生产认证。
 
 欢迎任何反馈：试用问题、兼容性报告、新平台/新语言支持需求、架构复用场景案例。请发送邮件至 **victorzhong0110@gmail.com**，或在 GitHub Issues 中提出。
 
 ## 许可证
 
 [MIT](./LICENSE)
+
+
+## 成本与预算（面试可讲）
+
+代码侧已有扫描上限（可在工具/budget 参数收紧）：
+
+- **fileBudget** — 单次扫描最多触达的文件数
+- **timeBudgetMs** — 扫描墙钟预算；系统画像默认约 20s 量级可调
+- **远程** — 未认证检索有速率限制；配置 `DSH_GITHUB_TOKEN` 可提高配额；token 只附加到 `api.github.com`
+- **模型上下文** — 命中路径与短片段会进入当前 Agent 上下文（本地源文件不上传检索平台）
+
+最坏情况口述：`reuse_survey` 在开启远程时 ≈ 本地扫描至 file/time cap + 有限次远程搜索；企业模板默认关闭远程，把外发关死。
